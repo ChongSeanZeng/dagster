@@ -18,6 +18,15 @@
 #}
 {% macro silver_dedupe(source_name, table_name, primary_key, cursor_field,
                        has_soft_delete=true, columns=none, live_ids_table=none) %}
+{# Only filter IsDeleted if the source actually has that column. Some Salesforce
+   objects (e.g. RecordType) have no IsDeleted field, so has_soft_delete=true must
+   not hard-require it. Checked at run time against the real bronze schema. #}
+{%- set has_isdeleted = false -%}
+{%- if has_soft_delete and execute -%}
+    {%- set _cols = adapter.get_columns_in_relation(source(source_name, table_name))
+                    | map(attribute='name') | map('lower') | list -%}
+    {%- set has_isdeleted = 'isdeleted' in _cols -%}
+{%- endif -%}
 with ranked as (
     select
         *,
@@ -28,7 +37,7 @@ with ranked as (
     from {{ source(source_name, table_name) }}
     {# IsDeleted may land as a boolean or as a "true"/"false" string depending on
        how the Salesforce Bulk API / dlt typed it — normalize both. #}
-    {% if has_soft_delete %}where not coalesce(try_cast({{ adapter.quote('IsDeleted') }} as boolean), false){% endif %}
+    {% if has_isdeleted %}where not coalesce(try_cast({{ adapter.quote('IsDeleted') }} as boolean), false){% endif %}
 ),
 deduped as (
     select *

@@ -45,7 +45,7 @@
 
 | 层 | 工具 | 位置 | 说明 |
 |----|------|------|------|
-| Bronze | dlt | DuckLake schema `bronze` | 拉取全部列，按 `Id` merge。Salesforce 用 `queryAll` 捕获软删除（`IsDeleted`）。 |
+| Bronze | dlt | DuckLake schema `bronze` | 拉取全部列，按 `Id` merge。**首次全量走 Bulk 2.0（快）**，**增量走 Bulk 1.0 `queryAll`**（捕获软删除 `IsDeleted`）。两条路径统一 schema：非游标列存文本、游标存 datetime。 |
 | Silver | dbt | DuckLake schema `silver` | 只保留 `silver_config.py` 指定的业务列；按游标去重取最新；剔除软删除；反连接 `__live_ids` 剔除硬删除；去掉 dlt 系统列。 |
 | Gold | dbt | DuckLake schema `gold` | 从 silver 聚合常见统计（`daily.py` / `monthly_test.py` 的移植），每次运行**追加**一个带 `snapshot_date` 的快照。 |
 | 发布 | duckdb + azure | Blob 容器 `duck` | 把 silver / gold 每张表导出为 Parquet 上传。 |
@@ -104,9 +104,12 @@ cd dagster
 
 ### 2. 创建虚拟环境并安装依赖
 
+> ⚠️ 用 **Python 3.11 / 3.12**（dbt-core 不支持 3.13/3.14）。
+
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
+python --version                 # 应显示 3.12.x
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
@@ -168,36 +171,53 @@ dagster dev -h 0.0.0.0 -p 3000
 
 代码路径全部是相对/动态的，因此在 Windows 上可以直接跑一套**独立的本地湖仓**（catalog、`lake/`、`publish/` 都生成在项目目录内），用于开发调试。步骤：
 
+代码路径全部相对/动态，Windows 上可跑一套**独立的本地湖仓**（catalog、`lake/`、`publish/` 都生成在项目目录内）用于调试。**除了首次装环境，其余全部在 Dagster UI 里点按钮完成，无需命令行。**
+
+> ⚠️ **Python 版本**：用 **3.11 / 3.12**。dbt-core 不支持 3.13/3.14——在 3.14 上 `import dbt` 会因 `mashumaro` 直接报错（`UnserializableField: Field "schema" ...`）。dlt/bronze 在 3.14 能跑，dbt 不行。
+
+**① 一次性装环境并启动 UI（命令行）**
+
 ```powershell
-# 在项目根目录（PowerShell）
-python -m venv .venv
+# 在项目根目录（PowerShell），用 Python 3.12
+py -3.12 -m venv .venv          # 或 python3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python --version                # 应显示 3.12.x
 pip install -r requirements.txt
 
 # 准备 local.setting.json（同 VM，见「配置」）
-# 设置 DAGSTER_HOME（必须绝对路径；用当前目录动态生成）
+# DAGSTER_HOME 必须绝对路径；用当前目录动态生成
 $env:DAGSTER_HOME = "$PWD\home"
 
-# 1) Bronze 必须先跑：它会在本地创建 DuckLake catalog 和 lake/ 数据目录
-python -c "import sf_bronze; print(sf_bronze.run_bronze(entities=['RecordType']))"
-
-# 2) 再跑 dbt（务必从 dbt 目录执行，profiles 用的是相对路径）
-cd dbt
-dbt seed --profiles-dir .
-dbt run --select silver.recordtype --profiles-dir .
-cd ..
-
-# 3) 启动 Dagster UI（从项目根运行）
+# 启动 UI（从项目根运行），浏览器打开 http://localhost:3000
 dagster dev
 ```
 
+**② 之后全部在 UI 里点按钮**（Assets 页面，每个资产右上角 **Materialize**；带 ▸ 的资产可在 Launchpad 里改 Config）：
+
+1. **Bronze**：点 `salesforce_bronze` → **Materialize**。想只测一个实体，在 Launchpad 里填：
+   ```yaml
+   ops:
+     salesforce_bronze:
+       config:
+         entities: ["RecordType"]   # 留空=全部 15 个实体
+         # seed_since_days: 7        # 可选：只回填最近 N 天，测大表时很有用
+   ```
+2. **Silver**：点 `silver` → **Materialize**。想只测一个模型、且不上传 blob：
+   ```yaml
+   ops:
+     silver:
+       config:
+         select: "silver.recordtype"  # 留空/默认=whole silver 层
+         publish: false               # 本地测试关掉上传；默认 true
+   ```
+3. **Gold**：点 `gold` → **Materialize**（`config` 可设 `snapshot_date`、`publish` 等，见「使用方式」）。
+
 要点：
 
-- **Bronze 必须先于 dbt 运行**。DuckLake 新建 catalog 时需要 `DATA_PATH`（由 dlt 的 `STORAGE` 提供）；dbt 只做「附加已存在的 catalog」，不带 `DATA_PATH`，所以必须先由 bronze 建好 catalog。
-- **catalog 与 `lake/` 必须在同一台机器**：数据文件的绝对路径记录在 catalog 元数据里。VM 上生成的 `lake_catalog.duckdb` 拿到 Windows 无法直接用（里面是 Linux 路径）——本地测试请重新跑一遍 bronze，生成本地的 catalog。
-- 已在 Windows 上验证：`INSTALL/LOAD ducklake+sqlite` → 用相对路径 `ATTACH 'ducklake:sqlite:../lake_catalog.duckdb'` → 建表 → `COPY ... TO parquet` 全部通过。
-- 需要联网让 DuckDB 首次 `INSTALL ducklake` / `INSTALL sqlite` / `INSTALL azure` 下载扩展。
-- Bronze 的抽取仍需 Salesforce / Dataverse 凭据与网络；纯 dbt / publish / 查询逻辑则可离线在本地湖仓上调试。
+- **Bronze 必须先于 dbt(silver/gold) 运行**。DuckLake 新建 catalog 时需要 `DATA_PATH`（由 dlt 的 `STORAGE` 提供）；dbt 只「附加已存在的 catalog」，不带 `DATA_PATH`，所以必须先由 bronze 建好 catalog。UI 里 `silver` 对 bronze 有依赖连线，先点 bronze 再点 silver 即可。
+- **catalog 与 `lake/` 必须在同一台机器**：数据文件的绝对路径记录在 catalog 元数据里。VM 上生成的 `lake_catalog.duckdb` 拿到 Windows 用不了（里面是 Linux 路径）——本地测试重新跑一遍 bronze 即可。
+- 已在 **Windows 3.12** 上端到端验证：`salesforce_bronze`（config `entities:["RecordType"]`）→ `silver`（`select:"silver.recordtype"`）全部 `RUN_SUCCESS`，silver 产物只有 `Id,Name`、46 行、无 dlt 列。
+- 需要联网让 DuckDB 首次 `INSTALL ducklake/sqlite/azure` 下载扩展；Bronze 抽取仍需 Salesforce/Dataverse 凭据。纯 dbt/publish/查询逻辑可离线在本地湖仓上调试。
 
 ---
 
@@ -211,13 +231,15 @@ fsc_lake:
   outputs:
     dev:
       type: duckdb
-      path: /home/ubuntu/dagster/dbt/dbt.duckdb   # 仅作 DuckDB 会话锚点
-      threads: 1                                   # DuckLake 的 SQLite catalog 单写，必须串行
+      path: dbt.duckdb                     # 相对 dbt/ 目录；仅作 DuckDB 会话锚点
+      threads: 1                            # DuckLake 的 SQLite catalog 单写，必须串行
       extensions: [sqlite, ducklake]
       attach:
-        - path: "ducklake:sqlite:/home/ubuntu/dagster/lake_catalog.duckdb"
-          alias: lake                              # 模型里通过 lake.silver.* / lake.gold.* 访问
+        - path: "ducklake:sqlite:../lake_catalog.duckdb"   # 相对路径 → 项目根的 catalog
+          alias: lake                       # 模型里通过 lake.silver.* / lake.gold.* 访问
 ```
+
+> 路径是**相对 dbt/ 目录**的，因此 dbt 必须从 `dbt/` 目录运行（Dagster 的 `silver`/`gold` 资产已用 `cwd=dbt/`；手动运行请先 `cd dbt`）。Linux/Windows 通用，无需改路径。
 
 ### 实体清单
 
@@ -232,24 +254,34 @@ fsc_lake:
 
 ## 使用方式
 
-### 方式一：Dagster UI（推荐）
+### 方式一：Dagster UI（推荐，全程点按钮）
 
-在 Dagster UI 的 **Assets** 页面，按依赖关系手动 **Materialize**：
+在 Dagster UI 的 **Assets** 页面手动 **Materialize**；每个资产都可在 Launchpad 里改 **Config**：
 
-| 资产 | 分组 | 作用 |
-|------|------|------|
-| `salesforce_bronze` | bronze | 增量加载 Salesforce → bronze |
-| `dataverse_bronze` | bronze | 增量加载 Dataverse → bronze |
-| `salesforce_id_sync` | bronze | **手动**：拉取 Salesforce 全部存活 Id（硬删除拉齐） |
-| `dataverse_id_sync` | bronze | **手动**：拉取 Dataverse 全部存活 Id（硬删除拉齐） |
-| `silver` | silver | 重新生成模型 → `dbt seed` → `dbt run --select silver` → 发布 Parquet |
-| `gold` | gold | `dbt run --select gold`（带当天 `snapshot_date`）→ 发布 Parquet |
+| 资产 | 分组 | 作用 | Launchpad 可配置项（Config） |
+|------|------|------|------|
+| `salesforce_bronze` | bronze | 增量加载 Salesforce → bronze | `entities`（子集，留空=全部）、`seed_since_days`（首次回填天数） |
+| `dataverse_bronze` | bronze | 增量加载 Dataverse → bronze | 同上 |
+| `salesforce_id_sync` | bronze | **手动**：Salesforce 存活 Id（硬删除拉齐） | `entities`（子集，留空=全部） |
+| `dataverse_id_sync` | bronze | **手动**：Dataverse 存活 Id（硬删除拉齐） | `entities` |
+| `silver` | silver | 重新生成模型 → `dbt seed` → `dbt run` silver → 发布 Parquet | `select`（默认 `silver`，可 `silver.<模型>`）、`publish`（默认 true） |
+| `gold` | gold | `dbt run` gold（带 `snapshot_date`）→ 发布 Parquet | `select`（默认 `gold`）、`snapshot_date`（留空=今天）、`publish` |
 
-典型流程：先 `salesforce_bronze` / `dataverse_bronze`，再 `silver`，最后 `gold`。硬删除拉齐按需单独触发（见下节）。
+Config 示例（Launchpad 里粘贴 YAML）：
 
-### 方式二：命令行直接运行
+```yaml
+ops:
+  salesforce_bronze:
+    config:
+      entities: ["Account", "Certificate_c__c"]   # 只加载这两个；留空=全部
+      seed_since_days: 30                          # 首次只回填最近 30 天
+```
 
-在项目根目录、已激活虚拟环境、已 `export DAGSTER_HOME=...` 的前提下：
+典型流程：先 `salesforce_bronze` / `dataverse_bronze`，再 `silver`，最后 `gold`。硬删除拉齐按需单独触发（见下节）。本地测试可在 `silver` 的 Config 里设 `publish: false` 关掉上传。
+
+### 方式二：命令行直接运行（可选，用于脚本 / VM 自动化）
+
+日常操作用上面的 UI 即可。如需脚本化，在项目根目录、已激活虚拟环境、已设 `DAGSTER_HOME` 的前提下：
 
 ```bash
 # Bronze —— 增量加载（不带参数=全部实体；也可指定单个实体）
@@ -389,7 +421,14 @@ SELECT * FROM lake.gold.members WHERE snapshot_date = (SELECT max(snapshot_date)
 - **路径可移植**：项目根由各模块 `__file__` 自动推断，dbt 用相对路径，Linux VM 与本地 Windows 通用，无需改路径。注意 catalog 与 `lake/` 是同机绑定的（元数据里是绝对路径），跨机器不能直接搬 `lake_catalog.duckdb`——换机器重跑 bronze 即可。
 - **catalog 是 SQLite**：`lake_catalog.duckdb` 实为 SQLite。dlt（`sf_bronze.py`/`dataverse_bronze.py` 的 `CATALOG`）与 dbt（`profiles.yml` 的 `attach`）必须指向同一个 SQLite catalog，否则 silver 读不到 bronze。
 - **列名大小写**：silver 用带引号的精确列名投影。若某列在 bronze 中的大小写与 `silver_config.py` 不一致（例如 `policy_omit_trademark_symbols__c`），silver 构建会报「列不存在」。排查：`DESCRIBE lake.bronze.<表名>;` 核对真实列名并同步到配置。
-- **DuckLake 单写**：`profiles.yml` 的 `threads: 1` 不要改大，SQLite catalog 并发提交会冲突。
+- **DuckLake 单写 / 并发**：catalog 是 SQLite，单写。两个资产同时写湖仓会报 `Failed to commit DuckLake transaction`。因此：dbt `threads: 1` 不要改大；Dagster 已用 `in_process_executor`（一个 run 内的资产串行，"Materialize all" 也安全）。要连**跨 run**（分别多次点 Materialize）也串行，在 `DAGSTER_HOME/dagster.yaml` 加：
+  ```yaml
+  run_coordinator:
+    module: dagster.core.run_coordinator
+    class: QueuedRunCoordinator
+    config:
+      max_concurrent_runs: 1
+  ```
 - **Gold 快照幂等**：同一 `snapshot_date` 重复运行 gold 不会重复追加（模型内有去重保护）；换一天则追加新快照。
 - **Gold 数值字段**：源自 Salesforce 的数值/日期在 bronze 里可能是字符串，gold 用 `try_cast` 容错，无法解析的值会变成 `NULL` 并在过滤中被排除。
 - **旧版脚本**：`daily.py` / `monthly_test.py` 仅作为 Gold 逻辑的对照参考，新栈不再依赖它们（`monthly_test.py` 第 169–171 行有历史遗留的语法问题，已在 dbt 移植中规避）。

@@ -6,7 +6,8 @@ local.setting.json
 lake_catalog.duckdb
 lake_catalog.duckdb.wal
 lake/
-
+lake.vmbak
+*.vmbak
 # --- published output parquet / json ---
 publish/
 

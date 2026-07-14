@@ -183,16 +183,23 @@ def _pipeline():
     )
 
 
-def run_bronze(seed_since=None):
-    """seed_since: only used on a resource's first run to bound the backfill
-    (e.g. now-1d for testing); ignored afterwards (dlt tracks modifiedon itself)."""
+def run_bronze(entities=None, seed_since=None):
+    """entities: optional list of entity sets (e.g. ['accounts']) to limit the run;
+    None = all configured. seed_since: only used on a resource's first run to bound
+    the backfill (e.g. a recent date for testing); ignored afterwards."""
     src = dataverse_source(initial_value=seed_since or INITIAL_VALUE)
+    if entities:
+        src = src.with_resources(*entities)
     return _pipeline().run(src, loader_file_format="parquet")
 
 
-def run_id_reconcile():
-    """Manual: refresh the live-id sets used by silver to drop hard-deleted rows."""
-    return _pipeline().run(dataverse_ids_source(), loader_file_format="parquet")
+def run_id_reconcile(entities=None):
+    """Manual: refresh the live-id sets used by silver to drop hard-deleted rows.
+    entities: optional list of entity sets to limit the run; None = all."""
+    src = dataverse_ids_source()
+    if entities:
+        src = src.with_resources(*[f"{e}__live_ids" for e in entities])
+    return _pipeline().run(src, loader_file_format="parquet")
 
 
 if __name__ == "__main__":

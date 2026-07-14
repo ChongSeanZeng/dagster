@@ -1,8 +1,16 @@
 """Bronze ingestion: Salesforce -> DuckLake via dlt.
 
-Give an entity's Salesforce API name; we `describe()` it, pull EVERY queryable
-column via Bulk 1.0 `queryAll` (so IsDeleted rows are captured for the silver-layer
-soft-delete), and MERGE into the DuckLake `bronze` dataset keyed on Id.
+Give an entity's Salesforce API name; we `describe()` it and pull EVERY queryable
+column, MERGE-ing into the DuckLake `bronze` dataset keyed on Id.
+
+Two extraction paths:
+  * FIRST load (backfill): Bulk API 2.0 `query` — far faster on large tables. Live
+    rows only (deletes are irrelevant with no prior state).
+  * INCREMENTAL load: Bulk API 1.0 `queryAll` — the only path that returns rows that
+    flipped to IsDeleted since the last watermark, so silver can soft-delete them.
+To keep the destination schema identical across both paths (Bulk 2.0 returns CSV =
+all strings; Bulk 1.0 returns typed JSON), every business column is normalized to
+text and the cursor to a UTC datetime; silver/gold cast types as needed.
 
 Incremental cursor is SystemModstamp (always present once we select all columns).
 A small LAG re-pulls the boundary each run; merge on Id makes that idempotent —
@@ -121,6 +129,24 @@ def queryable_fields(sf, entity):
     return [f["name"] for f in fields if f["type"] not in EXCLUDED_FIELD_TYPES]
 
 
+def _norm(rec, cursor_field):
+    """Normalize a raw Salesforce record to a stable destination schema:
+    the cursor field -> UTC datetime, every other column -> text (or None).
+
+    Bulk 2.0 (CSV) yields all-string values with "" for null; Bulk 1.0 (JSON)
+    yields typed values. Forcing business columns to text makes both paths produce
+    the SAME schema so dlt's merge never sees type drift; silver/gold cast as needed.
+    """
+    rec.pop("attributes", None)
+    out = {}
+    for k, v in rec.items():
+        if k == cursor_field:
+            continue
+        out[k] = None if v is None or v == "" else str(v)
+    out[cursor_field] = _parse_dt(rec.get(cursor_field))
+    return out
+
+
 def _make_resource(sf, entity, cursor_field, initial_value=EPOCH):
     @dlt.resource(name=entity.lower(), primary_key="Id", write_disposition="merge")
     def _res(cursor=dlt.sources.incremental(cursor_field, initial_value=initial_value)):
@@ -129,29 +155,32 @@ def _make_resource(sf, entity, cursor_field, initial_value=EPOCH):
         since = (last - timedelta(seconds=LAG_SECONDS)).astimezone(timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
-        soql = (
-            f"SELECT {', '.join(cols)} FROM {entity} "
-            f"WHERE {cursor_field} > {since} ORDER BY {cursor_field} ASC"
-        )
-        # First load pulls live rows only (plain `query`) — deleted records are
-        # irrelevant with no prior state and just bloat the backfill. Incremental
-        # runs use `query_all` (queryAll) so they also catch rows that flipped to
-        # IsDeleted since the last watermark, letting silver soft-delete them.
+        select = f"SELECT {', '.join(cols)} FROM {entity}"
         is_first = cursor.last_value is None or cursor.last_value == initial_value
-        method = "query" if is_first else "query_all"
-        print(f"[{entity}] {method} since {since} ({len(cols)} cols)", flush=True)
-        # lazy_operation=True streams result batches instead of materializing the
-        # ENTIRE result set as one Python list — essential for multi-million-row
-        # tables (Product_Species__c is ~7.4M rows). Memory stays bounded per batch.
         n = 0
-        for batch in getattr(getattr(sf.bulk, entity), method)(soql, lazy_operation=True):
-            for rec in batch:
-                rec.pop("attributes", None)
-                # normalize the cursor field so dlt's incremental compare is unambiguous
-                rec[cursor_field] = _parse_dt(rec.get(cursor_field))
-                yield rec
-            n += len(batch)
-            print(f"[{entity}] streamed {n} rows", flush=True)
+        if is_first:
+            # First (backfill) load: Bulk API 2.0 — much faster on large tables.
+            # Live rows only; no ORDER BY (dlt tracks the max cursor regardless).
+            soql = f"{select} WHERE {cursor_field} > {since}"
+            print(f"[{entity}] BULK2 backfill since {since} ({len(cols)} cols)", flush=True)
+            for chunk in getattr(sf.bulk2, entity).query(soql):
+                rows = 0
+                for row in csv.DictReader(io.StringIO(chunk)):
+                    yield _norm(row, cursor_field)
+                    rows += 1
+                n += rows
+                print(f"[{entity}] BULK2 streamed {n} rows", flush=True)
+        else:
+            # Incremental load: Bulk API 1.0 queryAll (the only API returning rows
+            # that flipped to IsDeleted). lazy_operation streams batches so memory
+            # stays bounded on large tables. ORDER BY keeps the LAG boundary tidy.
+            soql = f"{select} WHERE {cursor_field} > {since} ORDER BY {cursor_field} ASC"
+            print(f"[{entity}] BULK1 queryAll since {since} ({len(cols)} cols)", flush=True)
+            for batch in getattr(sf.bulk, entity).query_all(soql, lazy_operation=True):
+                for rec in batch:
+                    yield _norm(rec, cursor_field)
+                n += len(batch)
+                print(f"[{entity}] BULK1 streamed {n} rows", flush=True)
 
     return _res
 

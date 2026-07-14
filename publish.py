@@ -7,7 +7,8 @@ layers), writes it to a local parquet under ./publish, and uploads it to the
 `duck` container of the `synapsedeltalake2022` storage account (credentials from
 local.setting.json, the same connection string sf.py uses).
 
-Blob layout (within the `duck` container):
+Blob layout (within the `duck` container, account synapsedeltalake2022 ->
+https://synapsedeltalake2022.blob.core.windows.net/duck):
     duck/silver/<table>.parquet
     duck/gold/<table>.parquet
 
