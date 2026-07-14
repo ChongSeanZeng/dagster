@@ -1,0 +1,29 @@
+name: 'fsc'
+version: '1.0.0'
+config-version: 2
+profile: 'fsc_lake'
+
+model-paths: ["models"]
+
+seed-paths: ["seeds"]
+
+models:
+  fsc:
+    silver:
+      +materialized: table
+      +database: lake
+      +schema: silver
+    gold:
+      +materialized: table
+      +database: lake
+      +schema: gold
+
+seeds:
+  fsc:
+    +database: lake
+    +schema: gold
+    regions:
+      +column_types:
+        ISO3: varchar
+        Region: varchar
+        Functional_region: varchar

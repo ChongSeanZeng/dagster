@@ -1,0 +1,39 @@
+version: 2
+
+sources:
+  - name: bronze
+    database: lake
+    schema: bronze
+    tables:
+      - name: product_species__c
+      - name: product_classification__c
+      - name: account
+      - name: certificate_c__c
+      - name: certificate_status__c
+      - name: certificate_attachment__c
+      - name: contact
+      - name: non_certificate_holder__c
+      - name: country_data__c
+      - name: recordtype
+      - name: species__c
+      - name: evaluation__c
+      - name: project_certificate__c
+      - name: sales_history__c
+      - name: transaction_verification_findings__c
+      - name: accounts
+      - name: product_species__c__live_ids
+      - name: product_classification__c__live_ids
+      - name: account__live_ids
+      - name: certificate_c__c__live_ids
+      - name: certificate_status__c__live_ids
+      - name: certificate_attachment__c__live_ids
+      - name: contact__live_ids
+      - name: non_certificate_holder__c__live_ids
+      - name: country_data__c__live_ids
+      - name: recordtype__live_ids
+      - name: species__c__live_ids
+      - name: evaluation__c__live_ids
+      - name: project_certificate__c__live_ids
+      - name: sales_history__c__live_ids
+      - name: transaction_verification_findings__c__live_ids
+      - name: accounts__live_ids

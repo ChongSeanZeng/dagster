@@ -1,0 +1,25 @@
+# FSC 现代数据栈依赖（在 Linux VM 上安装）
+# 建议 Python 3.11+，使用虚拟环境。
+
+# 编排
+dagster
+dagster-webserver
+
+# Bronze 抽取（dlt + DuckLake）
+dlt>=1.6.0
+duckdb>=1.1.0
+simple-salesforce          # Salesforce（Bulk 1.0 / 2.0）
+adal                       # Dataverse (Azure AD) 认证
+requests                   # Dataverse OData 分页
+
+# Silver / Gold 转换（dbt）
+dbt-core
+dbt-duckdb                 # 自带 duckdb 适配器，运行时加载 ducklake / sqlite 扩展
+
+# 发布到 Azure Blob
+azure-storage-blob
+
+# 旧版参考脚本 daily.py / monthly_test.py 仍需要（新 gold 已用纯 dbt 重写，可选）
+polars
+fastexcel
+xlsxwriter
