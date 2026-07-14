@@ -21,7 +21,8 @@ import os
 import duckdb
 from azure.storage.blob import BlobServiceClient
 
-BASE = "/home/ubuntu/dagster"
+# Project root = this file's directory (forward-slash, portable Linux/Windows).
+BASE = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
 CATALOG_SQLITE = f"{BASE}/lake_catalog.duckdb"
 PUBLISH_DIR = f"{BASE}/publish"
 CONTAINER = "duck"

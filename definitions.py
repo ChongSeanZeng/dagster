@@ -19,6 +19,7 @@ Manual-trigger assets, no schedules yet. Lineage:
 Blob publishing targets the `duck` container (see publish.py).
 """
 
+import os
 import subprocess
 from datetime import date
 
@@ -29,7 +30,8 @@ import gen_silver
 import publish
 import sf_bronze as sf
 
-BASE = "/home/ubuntu/dagster"
+# Project root = this file's directory (forward-slash, portable Linux/Windows).
+BASE = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
 DBT_DIR = f"{BASE}/dbt"
 
 

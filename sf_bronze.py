@@ -28,17 +28,20 @@ from dlt.destinations import ducklake
 from dlt.destinations.impl.ducklake.configuration import DuckLakeCredentials
 from simple_salesforce import Salesforce
 
-BASE = "/home/ubuntu/dagster"
+# Project root = this file's own directory, as a forward-slash path. This lets
+# the same code run on the Linux VM (/home/ubuntu/dagster) and be tested locally
+# on Windows (C:/.../dagster) with no edits — DuckDB, dlt, sqlite and open() all
+# accept forward slashes on both platforms.
+BASE = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
 # The DuckLake catalog metadata lives in a SQLite database (the on-disk
 # lake_catalog.duckdb is a SQLite file). dlt (this bronze writer) and dbt
 # (the silver/gold reader) MUST point at the SAME catalog with the SAME
-# backend, otherwise silver cannot see bronze. dbt attaches
-# `ducklake:sqlite:/home/ubuntu/dagster/lake_catalog.duckdb`; the equivalent
-# SQLAlchemy-style connection string for dlt's DuckLakeCredentials is below.
-# NOTE: verify this scheme against the installed dlt version on the VM before
-# the first run — the goal is one shared SQLite catalog, not the backend name.
+# backend, otherwise silver cannot see bronze. dbt attaches the same file via
+# `ducklake:sqlite:...`; the equivalent connection string for dlt is below.
+# NOTE: verify this scheme against the installed dlt version before the first
+# run — the goal is one shared SQLite catalog, not the backend name.
 CATALOG = f"sqlite:///{BASE}/lake_catalog.duckdb"
-STORAGE = f"file://{BASE}/lake"
+STORAGE = f"file:///{BASE.lstrip('/')}/lake"
 DUCKLAKE_NAME = "fsc_lake"
 
 # To add a new Salesforce entity: append its API name here. That's it — all

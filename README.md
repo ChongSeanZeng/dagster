@@ -7,7 +7,7 @@
 - **转换（Silver / Gold）**：[dbt](https://www.getdbt.com/) —— Silver 只保留**指定列**、去重、去删除；Gold 定期**快照**常见统计指标。
 - **对外发布**：Silver / Gold 以 **Parquet** 发布到 Azure Blob `duck` 容器，供其他应用直接消费。
 
-> ⚠️ **本项目在 Linux VM 上运行**（路径全部写死为 `/home/ubuntu/dagster`）。仓库可能被 clone 到其他系统查看，但 **dlt / dbt / dagster 只在 VM 上运行与验证**。
+> ✅ **路径全部为相对路径**：各 Python 模块以「自身所在目录」为项目根（`os.path.dirname(os.path.abspath(__file__))`），dbt 用相对路径（相对 `dbt/` 目录）。因此**同一份代码在 Linux VM 与本地 Windows 上都能直接运行、无需改任何路径**。生产部署在 Linux VM，本地开发/测试可直接在 Windows 上跑（见 [本地测试（Windows）](#本地测试windows)）。
 
 ---
 
@@ -16,6 +16,7 @@
 - [架构与数据流](#架构与数据流)
 - [目录结构](#目录结构)
 - [部署到 VM](#部署到-vm)
+- [本地测试（Windows）](#本地测试windows)
 - [配置](#配置)
 - [使用方式](#使用方式)
   - [方式一：Dagster UI（推荐）](#方式一dagster-ui推荐)
@@ -99,7 +100,7 @@ git clone <your-repo-url> dagster
 cd dagster
 ```
 
-> 若仓库根目录不是 `/home/ubuntu/dagster`，需要同步修改各文件中的 `BASE` 常量与 `dbt/profiles.yml` 里的绝对路径（代码中路径是写死的）。
+> 项目根目录可以放在任意位置——`BASE` 由各模块的 `__file__` 自动推断，dbt 用相对路径，无需改任何路径常量。
 
 ### 2. 创建虚拟环境并安装依赖
 
@@ -135,10 +136,10 @@ pip install -r requirements.txt
 ### 4. 设置 Dagster 主目录
 
 ```bash
-export DAGSTER_HOME=/home/ubuntu/dagster/home
+export DAGSTER_HOME=$(pwd)/home        # 指向项目内的 home/ 目录
 ```
 
-建议把这行加入 `~/.bashrc` 或 systemd 服务的环境变量。
+建议把这行加入 `~/.bashrc` 或 systemd 服务的环境变量。`DAGSTER_HOME` 必须是**绝对路径**（Dagster 要求）；用 `$(pwd)/home` 即可从当前项目根动态得到，不必写死。若不设置，Dagster 会用临时目录（运行历史不持久，本地测试可接受）。
 
 ### 5. 首次校验 catalog 连通（重要）
 
@@ -160,6 +161,43 @@ dagster dev -h 0.0.0.0 -p 3000
 ```
 
 浏览器打开 `http://<vm-ip>:3000`。因为目前是手动触发、无定时调度，`dagster dev` 已足够；如需长期后台运行，可用 systemd 或 `nohup` 托管，并（若日后加调度）另跑 `dagster-daemon run`。
+
+---
+
+## 本地测试（Windows）
+
+代码路径全部是相对/动态的，因此在 Windows 上可以直接跑一套**独立的本地湖仓**（catalog、`lake/`、`publish/` 都生成在项目目录内），用于开发调试。步骤：
+
+```powershell
+# 在项目根目录（PowerShell）
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+# 准备 local.setting.json（同 VM，见「配置」）
+# 设置 DAGSTER_HOME（必须绝对路径；用当前目录动态生成）
+$env:DAGSTER_HOME = "$PWD\home"
+
+# 1) Bronze 必须先跑：它会在本地创建 DuckLake catalog 和 lake/ 数据目录
+python -c "import sf_bronze; print(sf_bronze.run_bronze(entities=['RecordType']))"
+
+# 2) 再跑 dbt（务必从 dbt 目录执行，profiles 用的是相对路径）
+cd dbt
+dbt seed --profiles-dir .
+dbt run --select silver.recordtype --profiles-dir .
+cd ..
+
+# 3) 启动 Dagster UI（从项目根运行）
+dagster dev
+```
+
+要点：
+
+- **Bronze 必须先于 dbt 运行**。DuckLake 新建 catalog 时需要 `DATA_PATH`（由 dlt 的 `STORAGE` 提供）；dbt 只做「附加已存在的 catalog」，不带 `DATA_PATH`，所以必须先由 bronze 建好 catalog。
+- **catalog 与 `lake/` 必须在同一台机器**：数据文件的绝对路径记录在 catalog 元数据里。VM 上生成的 `lake_catalog.duckdb` 拿到 Windows 无法直接用（里面是 Linux 路径）——本地测试请重新跑一遍 bronze，生成本地的 catalog。
+- 已在 Windows 上验证：`INSTALL/LOAD ducklake+sqlite` → 用相对路径 `ATTACH 'ducklake:sqlite:../lake_catalog.duckdb'` → 建表 → `COPY ... TO parquet` 全部通过。
+- 需要联网让 DuckDB 首次 `INSTALL ducklake` / `INSTALL sqlite` / `INSTALL azure` 下载扩展。
+- Bronze 的抽取仍需 Salesforce / Dataverse 凭据与网络；纯 dbt / publish / 查询逻辑则可离线在本地湖仓上调试。
 
 ---
 
@@ -348,7 +386,7 @@ SELECT * FROM lake.gold.members WHERE snapshot_date = (SELECT max(snapshot_date)
 
 ## 注意事项与排错
 
-- **只在 VM 运行**：所有路径写死为 `/home/ubuntu/dagster`；在 Windows/Mac 上只能做语法检查，不能跑 dlt/dbt。
+- **路径可移植**：项目根由各模块 `__file__` 自动推断，dbt 用相对路径，Linux VM 与本地 Windows 通用，无需改路径。注意 catalog 与 `lake/` 是同机绑定的（元数据里是绝对路径），跨机器不能直接搬 `lake_catalog.duckdb`——换机器重跑 bronze 即可。
 - **catalog 是 SQLite**：`lake_catalog.duckdb` 实为 SQLite。dlt（`sf_bronze.py`/`dataverse_bronze.py` 的 `CATALOG`）与 dbt（`profiles.yml` 的 `attach`）必须指向同一个 SQLite catalog，否则 silver 读不到 bronze。
 - **列名大小写**：silver 用带引号的精确列名投影。若某列在 bronze 中的大小写与 `silver_config.py` 不一致（例如 `policy_omit_trademark_symbols__c`），silver 构建会报「列不存在」。排查：`DESCRIBE lake.bronze.<表名>;` 核对真实列名并同步到配置。
 - **DuckLake 单写**：`profiles.yml` 的 `threads: 1` 不要改大，SQLite catalog 并发提交会冲突。

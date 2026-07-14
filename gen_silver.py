@@ -15,11 +15,15 @@ Hand-written custom silver models (listed in SKIP) are never overwritten.
     python gen_silver.py
 """
 
+import os
+
 import sf_bronze
 import dataverse_bronze
 from silver_config import published_columns
 
-DBT_SILVER = "/home/ubuntu/dagster/dbt/models/silver"
+# Project root = this file's directory (forward-slash, portable Linux/Windows).
+BASE = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
+DBT_SILVER = f"{BASE}/dbt/models/silver"
 
 # Entities whose silver model is hand-written (custom logic) — left alone.
 SKIP = set()

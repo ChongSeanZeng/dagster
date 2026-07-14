@@ -30,12 +30,13 @@ import requests
 from dlt.destinations import ducklake
 from dlt.destinations.impl.ducklake.configuration import DuckLakeCredentials
 
-BASE = "/home/ubuntu/dagster"
+# Project root = this file's own directory, forward-slash (portable Linux/Windows).
+# See sf_bronze.py for the rationale.
+BASE = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
 # Shared SQLite DuckLake catalog — must match sf_bronze.py and dbt/profiles.yml
-# (the on-disk lake_catalog.duckdb is a SQLite file). See sf_bronze.py for the
-# rationale; verify the scheme against the installed dlt version on the VM.
+# (the on-disk lake_catalog.duckdb is a SQLite file).
 CATALOG = f"sqlite:///{BASE}/lake_catalog.duckdb"
-STORAGE = f"file://{BASE}/lake"
+STORAGE = f"file:///{BASE.lstrip('/')}/lake"
 DUCKLAKE_NAME = "fsc_lake"
 
 # To add a Dataverse entity: "<entity set (plural)>": "<primary key field>".
