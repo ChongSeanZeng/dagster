@@ -1,0 +1,28 @@
+# FSC 现代数据栈依赖。
+# ⚠️ Python 版本：请用 3.11 或 3.12。dbt-core 目前不支持 3.13/3.14
+#    （在 3.14 上 `import dbt` 会因 mashumaro 报错）。dlt 侧可在 3.14 运行，
+#    但为了 dbt 能跑，请整个项目统一用 3.12 建虚拟环境。
+
+# 编排
+dagster
+dagster-webserver
+
+# Bronze 抽取（dlt + DuckLake）
+dlt>=1.6.0
+duckdb>=1.1.0
+pyarrow>=15.0.0            # dlt 以 parquet 格式写入时需要（loader_file_format="parquet"）
+simple-salesforce          # Salesforce（Bulk 1.0 / 2.0）
+adal                       # Dataverse (Azure AD) 认证
+requests                   # Dataverse OData 分页
+
+# Silver / Gold 转换（dbt）
+dbt-core
+dbt-duckdb                 # 自带 duckdb 适配器，运行时加载 ducklake / sqlite 扩展
+
+# 发布到 Azure Blob
+azure-storage-blob
+
+# 旧版参考脚本 daily.py / monthly_test.py 仍需要（新 gold 已用纯 dbt 重写，可选）
+polars
+fastexcel
+xlsxwriter

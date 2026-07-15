@@ -1,0 +1,22 @@
+fsc_lake:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      # Paths are RELATIVE to the dbt working directory (this dbt/ folder). dbt is
+      # always invoked from here (README instructs `cd dbt`; the Dagster asset sets
+      # cwd=dbt/). This keeps the project portable — Linux VM or local Windows — with
+      # no absolute paths. If you run dbt from elsewhere, `cd` into dbt/ first.
+      # scratch anchor DB; all models materialize into the attached DuckLake `lake`
+      path: dbt.duckdb
+      # DuckLake's SQLite catalog is single-writer; concurrent model commits
+      # conflict ("Failed to commit DuckLake transaction"), so serialize.
+      threads: 1
+      extensions:
+        - sqlite
+        - ducklake
+      attach:
+        # DuckLake catalog (SQLite metadata backend, in the project root, one level
+        # up from dbt/); data file paths are read from the catalog metadata.
+        - path: "ducklake:sqlite:../lake_catalog.duckdb"
+          alias: lake
