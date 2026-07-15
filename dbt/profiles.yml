@@ -9,14 +9,18 @@ fsc_lake:
       # no absolute paths. If you run dbt from elsewhere, `cd` into dbt/ first.
       # scratch anchor DB; all models materialize into the attached DuckLake `lake`
       path: dbt.duckdb
-      # DuckLake's SQLite catalog is single-writer; concurrent model commits
-      # conflict ("Failed to commit DuckLake transaction"), so serialize.
-      threads: 1
+      # Postgres-backed catalog supports concurrent writers, so dbt can build
+      # independent models in parallel. (Models writing the same table would still
+      # serialize via optimistic-concurrency retry, but dbt's DAG avoids that.)
+      threads: 4
       extensions:
-        - sqlite
+        - postgres
         - ducklake
       attach:
-        # DuckLake catalog (SQLite metadata backend, in the project root, one level
-        # up from dbt/); data file paths are read from the catalog metadata.
-        - path: "ducklake:sqlite:../lake_catalog.duckdb"
+        # DuckLake catalog (Postgres metadata backend); data file paths are read
+        # from the catalog metadata. The full `postgres:...` connection (with the
+        # password) is injected as DUCKLAKE_CATALOG so it stays out of this file —
+        # Dagster's dbt asset sets it (catalog.dbt_env()); for a manual `dbt` run,
+        # export it first:  export DUCKLAKE_CATALOG="$(python -c 'import catalog;print(catalog.dbt_env()["DUCKLAKE_CATALOG"])')"
+        - path: "ducklake:{{ env_var('DUCKLAKE_CATALOG') }}"
           alias: lake

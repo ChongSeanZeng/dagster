@@ -28,13 +28,14 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-from dagster import AssetExecutionContext, Config, Definitions, asset, in_process_executor
+from dagster import AssetExecutionContext, Config, Definitions, asset, multiprocess_executor
 
 # Ensure the sibling modules (sf_bronze, dataverse_bronze, gen_silver, publish)
 # are importable no matter how Dagster loads this file or what the cwd is — the
 # project dir isn't automatically on sys.path when loaded via workspace.yaml.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import catalog  # noqa: E402
 import dataverse_bronze as dv  # noqa: E402
 import gen_silver  # noqa: E402
 import publish  # noqa: E402
@@ -53,6 +54,11 @@ class BronzeConfig(Config):
     # Bound the FIRST-run backfill to the last N days (handy for testing large
     # tables). Empty/None = full history. Ignored once dlt has a stored cursor.
     seed_since_days: Optional[int] = None
+    # Drop the selected entities' bronze table + dlt incremental cursor and reload
+    # from scratch. Use to fix a cursor left at the wrong watermark by an earlier
+    # bounded/test run. Combine with `entities` to refresh just one; leave
+    # `seed_since_days` empty for full history.
+    full_refresh: bool = False
 
 
 class IdSyncConfig(Config):
@@ -78,7 +84,10 @@ class GoldConfig(Config):
 # ------------------------------------------------------------------- dbt helper
 def _run(context, cmd, cwd=None):
     context.log.info("$ " + " ".join(cmd))
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    # Inject the DuckLake catalog connection (with password) via env so it stays
+    # out of dbt/profiles.yml and out of the logged command line.
+    env = {**os.environ, **catalog.dbt_env()}
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
     if proc.stdout:
         context.log.info(proc.stdout)
     if proc.stderr:
@@ -88,18 +97,32 @@ def _run(context, cmd, cwd=None):
     return proc.stdout
 
 
+# Resolve the dbt console script next to the running interpreter (…/.venv/bin/dbt).
+# Dagster may be launched with a PATH that doesn't include the venv bin, so a bare
+# "dbt" raises FileNotFoundError; an absolute path is PATH-independent. Fall back to
+# "dbt" on PATH if for some reason it isn't a sibling of sys.executable.
+_DBT_BIN = os.path.join(os.path.dirname(sys.executable), "dbt")
+if not os.path.exists(_DBT_BIN):
+    _DBT_BIN = "dbt"
+
+
 def _dbt(context, *args):
-    return _run(context, ["dbt", *args, "--profiles-dir", DBT_DIR], cwd=DBT_DIR)
+    return _run(context, [_DBT_BIN, *args, "--profiles-dir", DBT_DIR], cwd=DBT_DIR)
 
 
 # ---------------------------------------------------------------- bronze (dlt)
 @asset(group_name="bronze")
 def salesforce_bronze(context: AssetExecutionContext, config: BronzeConfig):
-    """Incrementally load Salesforce entities into DuckLake bronze via dlt."""
+    """Incrementally load Salesforce entities into DuckLake bronze (direct, no dlt)."""
     seed = None
     if config.seed_since_days:
         seed = datetime.now(timezone.utc) - timedelta(days=config.seed_since_days)
-    info = sf.run_bronze(entities=config.entities or None, seed_since=seed)
+    info = sf.run_bronze(
+        entities=config.entities or None,
+        seed_since=seed,
+        full_refresh=config.full_refresh,
+        log=context.log.info,
+    )
     context.log.info(str(info))
     return str(info)
 
@@ -112,7 +135,12 @@ def dataverse_bronze(context: AssetExecutionContext, config: BronzeConfig):
         seed = (datetime.now(timezone.utc) - timedelta(days=config.seed_since_days)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
-    info = dv.run_bronze(entities=config.entities or None, seed_since=seed)
+    info = dv.run_bronze(
+        entities=config.entities or None,
+        seed_since=seed,
+        full_refresh=config.full_refresh,
+        log=context.log.info,
+    )
     context.log.info(str(info))
     return str(info)
 
@@ -125,7 +153,7 @@ def salesforce_id_sync(context: AssetExecutionContext, config: IdSyncConfig):
     reconciles *hard* deletes (physically removed rows). Run on demand, then
     rebuild silver.
     """
-    info = sf.run_id_reconcile(entities=config.entities or None)
+    info = sf.run_id_reconcile(entities=config.entities or None, log=context.log.info)
     context.log.info(str(info))
     return str(info)
 
@@ -137,7 +165,7 @@ def dataverse_id_sync(context: AssetExecutionContext, config: IdSyncConfig):
     Dataverse has no soft-delete marker reachable by an incremental pull, so this
     is the only way to reconcile deletes. Run on demand, not every increment.
     """
-    info = dv.run_id_reconcile(entities=config.entities or None)
+    info = dv.run_id_reconcile(entities=config.entities or None, log=context.log.info)
     context.log.info(str(info))
     return str(info)
 
@@ -179,11 +207,12 @@ def gold(context: AssetExecutionContext, config: GoldConfig):
     return f"built {snapshot_date} (not published)"
 
 
-# DuckLake's catalog (SQLite) is single-writer: two assets writing the lake at the
-# same time raise "Failed to commit DuckLake transaction". in_process_executor runs
-# a run's assets serially (one process), so materializing several at once — or
-# "Materialize all" — never writes the lake concurrently. See README for how to also
-# cap CONCURRENT RUNS (separate launches) via dagster.yaml.
+# Concurrency: the DuckLake catalog now lives in Postgres, which supports
+# concurrent writers (different tables are independent; same-table concurrent
+# commits use optimistic concurrency and retry). So within a run, assets can run
+# in parallel — e.g. salesforce_bronze and dataverse_bronze write different tables
+# at once. max_concurrent caps the worker processes per run; cross-run concurrency
+# is capped separately by QueuedRunCoordinator in home/dagster.yaml.
 defs = Definitions(
     assets=[
         salesforce_bronze,
@@ -193,5 +222,5 @@ defs = Definitions(
         silver,
         gold,
     ],
-    executor=in_process_executor,
+    executor=multiprocess_executor.configured({"max_concurrent": 4}),
 )

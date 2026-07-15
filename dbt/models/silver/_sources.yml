@@ -21,6 +21,7 @@ sources:
       - name: sales_history__c
       - name: transaction_verification_findings__c
       - name: accounts
+      - name: fsc_aaf_calculationses
       - name: product_species__c__live_ids
       - name: product_classification__c__live_ids
       - name: account__live_ids
@@ -37,3 +38,4 @@ sources:
       - name: sales_history__c__live_ids
       - name: transaction_verification_findings__c__live_ids
       - name: accounts__live_ids
+      - name: fsc_aaf_calculationses__live_ids

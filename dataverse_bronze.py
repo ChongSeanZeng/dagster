@@ -30,19 +30,26 @@ import requests
 from dlt.destinations import ducklake
 from dlt.destinations.impl.ducklake.configuration import DuckLakeCredentials
 
+import catalog
+
 # Project root = this file's own directory, forward-slash (portable Linux/Windows).
 # See sf_bronze.py for the rationale.
 BASE = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
-# Shared SQLite DuckLake catalog — must match sf_bronze.py and dbt/profiles.yml
-# (the on-disk lake_catalog.duckdb is a SQLite file).
-CATALOG = f"sqlite:///{BASE}/lake_catalog.duckdb"
-STORAGE = f"file:///{BASE.lstrip('/')}/lake"
-DUCKLAKE_NAME = "fsc_lake"
+# Shared DuckLake catalog — metadata in local Postgres, data as Parquet under
+# ./lake_pg (connection built in catalog.py). Must match sf_bronze.py and
+# dbt/profiles.yml.
+CATALOG = catalog.dlt_catalog()
+STORAGE = catalog.STORAGE
+DUCKLAKE_NAME = catalog.DUCKLAKE_NAME
 
 # To add a Dataverse entity: "<entity set (plural)>": "<primary key field>".
 # account -> set "accounts", pk "accountid".
 ENTITIES = {
     "accounts": "accountid",
+    # NB: the entity's logical name is already "fsc_aaf_calculations" (trailing s),
+    # so Dataverse pluralises the *set* to "...calculationses" (adds -es). The URL
+    # segment must be the set name, not the logical name.
+    "fsc_aaf_calculationses": "fsc_aaf_calculationsid"
 }
 
 CURSOR_FIELD = "modifiedon"
@@ -99,6 +106,22 @@ def _headers(annotations=True):
     }
 
 
+# Progress sink. Defaults to a flushing print (so lines show immediately even when
+# stdout is a pipe/file); run_bronze / run_id_reconcile set this to the caller's
+# logger (Dagster passes context.log.info) so the current entity/table shows up in
+# the run log. Kept as a module global rather than a resource arg so a
+# non-serializable callable never flows through dlt's @source/@resource signatures.
+def _print_flush(msg):
+    print(msg, flush=True)
+
+
+_LOG = _print_flush
+
+
+def _log(msg):
+    _LOG(msg)
+
+
 def _paged_get(url, headers):
     """Yield pages (lists of records) following @odata.nextLink, with simple retry."""
     session = requests.Session()
@@ -109,16 +132,16 @@ def _paged_get(url, headers):
             if resp.status_code in (429, 500, 502, 503, 504):
                 raise requests.exceptions.RequestException(f"transient {resp.status_code}")
             if resp.status_code != 200:
-                print(f"  non-retriable {resp.status_code}: {resp.text[:200]}", flush=True)
+                _log(f"  non-retriable {resp.status_code}: {resp.text[:200]}")
                 break
             data = resp.json()
             items = data.get("value", [])
             page += 1
-            print(f"  page {page}: {len(items)} rows", flush=True)
+            _log(f"  page {page}: {len(items)} rows")
             yield items
             url = data.get("@odata.nextLink")
         except requests.exceptions.RequestException as e:
-            print(f"  transient error: {e}; retrying in 10s", flush=True)
+            _log(f"  transient error: {e}; retrying in 10s")
             time.sleep(10)
             session = requests.Session()
             continue
@@ -137,7 +160,7 @@ def _make_resource(entity_set, id_field, initial_value=INITIAL_VALUE):
             f"{_creds()['resource']}/api/data/v9.2/{entity_set}"
             f"?$filter={CURSOR_FIELD} gt {last}&$orderby={CURSOR_FIELD} asc"
         )
-        print(f"[{entity_set}] incremental since {last}", flush=True)
+        _log(f"[{entity_set}] incremental since {last} -> bronze.{entity_set}")
         for items in _paged_get(url, headers):
             yield items
 
@@ -153,7 +176,7 @@ def _make_ids_resource(entity_set, id_field):
         headers = _headers(annotations=False)
         headers["Authorization"] = "Bearer " + token
         url = f"{_creds()['resource']}/api/data/v9.2/{entity_set}?$select={id_field}"
-        print(f"[{entity_set}] id 拉齐 (full ids)", flush=True)
+        _log(f"[{entity_set}] id 拉齐 (full ids) -> bronze.{entity_set}__live_ids")
         for items in _paged_get(url, headers):
             yield [{id_field: r[id_field]} for r in items]
 
@@ -183,19 +206,33 @@ def _pipeline():
     )
 
 
-def run_bronze(entities=None, seed_since=None):
+def run_bronze(entities=None, seed_since=None, full_refresh=False, log=print):
     """entities: optional list of entity sets (e.g. ['accounts']) to limit the run;
     None = all configured. seed_since: only used on a resource's first run to bound
-    the backfill (e.g. a recent date for testing); ignored afterwards."""
+    the backfill (e.g. a recent date for testing); ignored afterwards.
+    full_refresh: drop the selected resources' table + dlt incremental cursor and
+    reload from scratch (INITIAL_VALUE, i.e. full history unless seed_since is set).
+    Use this to fix a cursor left at the wrong watermark by an earlier bounded run.
+    log: progress sink (Dagster passes context.log.info) so the current entity
+    shows up in the run log."""
+    global _LOG
+    _LOG = log
     src = dataverse_source(initial_value=seed_since or INITIAL_VALUE)
     if entities:
         src = src.with_resources(*entities)
-    return _pipeline().run(src, loader_file_format="parquet")
+    # "drop_resources" wipes only the resources selected for this run (so a full
+    # refresh of one entity leaves the others' cursors intact); None = normal
+    # incremental. See sf_bronze.run_bronze for the mirror implementation.
+    refresh = "drop_resources" if full_refresh else None
+    return _pipeline().run(src, loader_file_format="parquet", refresh=refresh)
 
 
-def run_id_reconcile(entities=None):
+def run_id_reconcile(entities=None, log=print):
     """Manual: refresh the live-id sets used by silver to drop hard-deleted rows.
-    entities: optional list of entity sets to limit the run; None = all."""
+    entities: optional list of entity sets to limit the run; None = all.
+    log: progress sink (Dagster passes context.log.info)."""
+    global _LOG
+    _LOG = log
     src = dataverse_ids_source()
     if entities:
         src = src.with_resources(*[f"{e}__live_ids" for e in entities])

@@ -1,24 +1,30 @@
-"""Bronze ingestion: Salesforce -> DuckLake via dlt.
+"""Bronze ingestion: Salesforce -> DuckLake (direct, no dlt).
 
-Give an entity's Salesforce API name; we `describe()` it and pull EVERY queryable
-column, MERGE-ing into the DuckLake `bronze` dataset keyed on Id.
+Give an entity's Salesforce API name; we `describe()` it, pull EVERY queryable
+column and MERGE it into the DuckLake `bronze` dataset keyed on Id.
 
 Two extraction paths:
-  * FIRST load (backfill): Bulk API 2.0 `query` — far faster on large tables. Live
-    rows only (deletes are irrelevant with no prior state).
-  * INCREMENTAL load: Bulk API 1.0 `queryAll` — the only path that returns rows that
-    flipped to IsDeleted since the last watermark, so silver can soft-delete them.
-To keep the destination schema identical across both paths (Bulk 2.0 returns CSV =
-all strings; Bulk 1.0 returns typed JSON), every business column is normalized to
-text and the cursor to a UTC datetime; silver/gold cast types as needed.
+  * FIRST load (backfill): Bulk API 2.0 `query` — far faster on large tables.
+    Live rows only (deletes are irrelevant with no prior state).
+  * INCREMENTAL load: Bulk API 1.0 `queryAll` — the only path that returns rows
+    that flipped to IsDeleted since the watermark, so silver can soft-delete them.
+Both order by the cursor ASC and stream page-by-page; every business column is
+normalized to text and the cursor to a UTC datetime, so the two paths produce an
+IDENTICAL destination schema (silver/gold cast types as needed).
 
-Incremental cursor is SystemModstamp (always present once we select all columns).
-A small LAG re-pulls the boundary each run; merge on Id makes that idempotent —
-this replaces the hand-rolled watermark.csv / enforce_schema logic in sf.py.
+Why no dlt (Salesforce only): dlt's extract->normalize->load round-trip and its
+pinned DuckLake extension added latency and version-coupling with the shared
+catalog. Here we write straight to DuckLake with duckdb — build an Arrow batch
+per page and upsert it (delete-by-Id + insert). Because pages arrive ordered by
+the cursor and are committed as they load, a partial/interrupted run is a safe
+prefix: the next run resumes from max(cursor) already stored. That watermark IS
+the incremental state — no watermark.csv, no dlt cursor. Dataverse still uses dlt
+(see dataverse_bronze.py); both write the same DuckLake `bronze` dataset.
 
-Metadata (the DuckLake catalog) lives in a local DuckDB file; the actual data
-files are Parquet under ./lake. Nothing here touches Salesforce for deletes on a
-normal run — hard-delete reconciliation ("id 拉齐") is a separate manual step.
+The DuckLake catalog metadata is a local Postgres database (see catalog.py); data
+files are Parquet under ./lake_pg. Hard-delete reconciliation ("id 拉齐") is a
+separate manual step (run_id_reconcile) that snapshots the live Ids into
+<table>__live_ids.
 """
 
 import csv
@@ -27,35 +33,28 @@ import os
 from datetime import datetime, timedelta, timezone
 
 # Preserve original Salesforce column names (Id, SystemModstamp, Genus__c) instead
-# of dlt's default snake_case — keeps the "don't specify columns" promise end-to-end
-# and lets published parquet match what existing consumers already expect.
+# of any snake_casing — keeps the "don't specify columns" promise end-to-end and
+# lets published parquet match what existing consumers already expect.
 os.environ.setdefault("SCHEMA__NAMING", "direct")
 
-import dlt
-from dlt.destinations import ducklake
-from dlt.destinations.impl.ducklake.configuration import DuckLakeCredentials
+import duckdb
+import pyarrow as pa
 from simple_salesforce import Salesforce
 
-# Project root = this file's own directory, as a forward-slash path. This lets
-# the same code run on the Linux VM (/home/ubuntu/dagster) and be tested locally
-# on Windows (C:/.../dagster) with no edits — DuckDB, dlt, sqlite and open() all
-# accept forward slashes on both platforms.
-BASE = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
-# The DuckLake catalog metadata lives in a SQLite database (the on-disk
-# lake_catalog.duckdb is a SQLite file). dlt (this bronze writer) and dbt
-# (the silver/gold reader) MUST point at the SAME catalog with the SAME
-# backend, otherwise silver cannot see bronze. dbt attaches the same file via
-# `ducklake:sqlite:...`; the equivalent connection string for dlt is below.
-# NOTE: verify this scheme against the installed dlt version before the first
-# run — the goal is one shared SQLite catalog, not the backend name.
-CATALOG = f"sqlite:///{BASE}/lake_catalog.duckdb"
-STORAGE = f"file:///{BASE.lstrip('/')}/lake"
-DUCKLAKE_NAME = "fsc_lake"
+import catalog
 
-# To add a new Salesforce entity: append its API name here. That's it — all
-# columns are pulled automatically via describe(), and the cursor defaults to
-# SystemModstamp (present on every standard/custom object). The bronze table is
-# named entity.lower(); silver column projection lives in silver_config.py.
+# Project root = this file's directory, forward-slash (portable Linux/Windows).
+BASE = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
+# One shared DuckLake catalog — metadata now in local Postgres (db `fsc_lake`),
+# data files as Parquet under ./lake_pg. Connection built in catalog.py from
+# local.setting.json; MUST match dataverse_bronze.py and dbt/profiles.yml.
+# Requires duckdb >= 1.5 (ducklake 1.0-format catalog).
+DUCKLAKE_NAME = catalog.DUCKLAKE_NAME
+BRONZE_SCHEMA = "bronze"
+
+# To add a new Salesforce entity: append its API name here. All columns are
+# pulled automatically via describe(); the cursor defaults to SystemModstamp. The
+# bronze table is named entity.lower(); silver projection lives in silver_config.py.
 ENTITIES = [
     "Product_Species__c",
     "Product_Classification__c",
@@ -85,12 +84,20 @@ CURSOR_OVERRIDES = {
 def _cursor_for(entity):
     return CURSOR_OVERRIDES.get(entity, "SystemModstamp")
 
+
+def _print_flush(msg):
+    """Default progress sink: print that flushes immediately (visible in piped/
+    file output). Dagster overrides this with context.log.info."""
+    print(msg, flush=True)
+
+
 # Bulk 1.0 cannot query compound (address/location) or base64 fields; drop them.
 EXCLUDED_FIELD_TYPES = {"address", "location", "base64"}
 LAG_SECONDS = 120  # safety margin, mirrors sf.py's -2min; merge makes the re-pull free
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
+# --------------------------------------------------------------- Salesforce auth
 def _login():
     with open(f"{BASE}/local.setting.json") as f:
         return eval(f.read())
@@ -113,6 +120,8 @@ def _parse_dt(v):
     """
     if v is None or v == "":
         return None
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
     if isinstance(v, (int, float)):
         return datetime.fromtimestamp(v / 1000, tz=timezone.utc)
     s = str(v).strip().replace("Z", "+0000")
@@ -135,7 +144,7 @@ def _norm(rec, cursor_field):
 
     Bulk 2.0 (CSV) yields all-string values with "" for null; Bulk 1.0 (JSON)
     yields typed values. Forcing business columns to text makes both paths produce
-    the SAME schema so dlt's merge never sees type drift; silver/gold cast as needed.
+    the SAME schema; silver/gold cast as needed.
     """
     rec.pop("attributes", None)
     out = {}
@@ -147,119 +156,197 @@ def _norm(rec, cursor_field):
     return out
 
 
-def _make_resource(sf, entity, cursor_field, initial_value=EPOCH):
-    @dlt.resource(name=entity.lower(), primary_key="Id", write_disposition="merge")
-    def _res(cursor=dlt.sources.incremental(cursor_field, initial_value=initial_value)):
-        cols = queryable_fields(sf, entity)
-        last = cursor.last_value or EPOCH
-        since = (last - timedelta(seconds=LAG_SECONDS)).astimezone(timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-        select = f"SELECT {', '.join(cols)} FROM {entity}"
-        is_first = cursor.last_value is None or cursor.last_value == initial_value
-        n = 0
-        if is_first:
-            # First (backfill) load: Bulk API 2.0 — much faster on large tables.
-            # Live rows only; no ORDER BY (dlt tracks the max cursor regardless).
-            soql = f"{select} WHERE {cursor_field} > {since}"
-            print(f"[{entity}] BULK2 backfill since {since} ({len(cols)} cols)", flush=True)
-            for chunk in getattr(sf.bulk2, entity).query(soql):
-                rows = 0
-                for row in csv.DictReader(io.StringIO(chunk)):
-                    yield _norm(row, cursor_field)
-                    rows += 1
-                n += rows
-                print(f"[{entity}] BULK2 streamed {n} rows", flush=True)
+# ------------------------------------------------------------------ DuckLake I/O
+def _connect():
+    """DuckDB connection with the shared (Postgres-backed) DuckLake catalog
+    attached + bronze schema ensured."""
+    con = duckdb.connect()
+    con.execute("INSTALL postgres; LOAD postgres; INSTALL ducklake; LOAD ducklake;")
+    con.execute(f"ATTACH '{catalog.duckdb_attach_target()}' AS {DUCKLAKE_NAME}")
+    con.execute(f"CREATE SCHEMA IF NOT EXISTS {DUCKLAKE_NAME}.{BRONZE_SCHEMA}")
+    return con
+
+
+def _fqtn(table):
+    return f'{DUCKLAKE_NAME}.{BRONZE_SCHEMA}."{table}"'
+
+
+def _table_exists(con, table):
+    return (
+        con.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_catalog=? AND table_schema=? AND table_name=?",
+            [DUCKLAKE_NAME, BRONZE_SCHEMA, table],
+        ).fetchone()[0]
+        > 0
+    )
+
+
+def _watermark(con, table, cursor_field):
+    """Max cursor already stored = the incremental watermark (EPOCH if new/empty)."""
+    if not _table_exists(con, table):
+        return EPOCH
+    v = con.execute(f'SELECT max("{cursor_field}") FROM {_fqtn(table)}').fetchone()[0]
+    if v is None:
+        return EPOCH
+    return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+
+
+def _to_arrow(rows, cols, cursor_field):
+    """Columnar batch with an explicit, stable schema: cursor -> UTC timestamp,
+    every other column -> text. Explicit types keep the schema identical across
+    pages and across the Bulk 2.0 / Bulk 1.0 paths (no type inference drift)."""
+    fields, arrays = [], []
+    for c in cols:
+        if c == cursor_field:
+            typ = pa.timestamp("us", tz="UTC")
         else:
-            # Incremental load: Bulk API 1.0 queryAll (the only API returning rows
-            # that flipped to IsDeleted). lazy_operation streams batches so memory
-            # stays bounded on large tables. ORDER BY keeps the LAG boundary tidy.
-            soql = f"{select} WHERE {cursor_field} > {since} ORDER BY {cursor_field} ASC"
-            print(f"[{entity}] BULK1 queryAll since {since} ({len(cols)} cols)", flush=True)
-            for batch in getattr(sf.bulk, entity).query_all(soql, lazy_operation=True):
-                for rec in batch:
-                    yield _norm(rec, cursor_field)
-                n += len(batch)
-                print(f"[{entity}] BULK1 streamed {n} rows", flush=True)
-
-    return _res
+            typ = pa.string()
+        fields.append(pa.field(c, typ))
+        arrays.append(pa.array([r.get(c) for r in rows], type=typ))
+    return pa.table(arrays, schema=pa.schema(fields))
 
 
-def _make_ids_resource(sf, entity):
-    """id-only full pull for hard-delete reconciliation ("id 拉齐"), mirroring
-    dataverse_bronze._make_ids_resource.
+def _upsert(con, table, batch, primary_key):
+    """Idempotent merge of an Arrow batch: create the table on first sight,
+    otherwise delete rows whose pk is in the batch and re-insert (by column name)."""
+    con.register("_incoming", batch)
+    try:
+        if not _table_exists(con, table):
+            con.execute(f"CREATE TABLE {_fqtn(table)} AS SELECT * FROM _incoming")
+        else:
+            con.execute(
+                f'DELETE FROM {_fqtn(table)} '
+                f'WHERE "{primary_key}" IN (SELECT "{primary_key}" FROM _incoming)'
+            )
+            con.execute(f"INSERT INTO {_fqtn(table)} BY NAME SELECT * FROM _incoming")
+    finally:
+        con.unregister("_incoming")
 
-    Salesforce soft-deletes (IsDeleted=True) are already caught by the
-    incremental `query_all` and dropped in silver. A *hard* delete physically
-    removes the row, so it simply stops appearing — no incremental pull can see
-    it. This resource pulls the full set of live Ids (cheapest possible request)
-    via Bulk 2.0 (plain query = live rows only) into <entity>__live_ids, and the
-    silver layer anti-joins it to drop rows the source no longer has. Run on
-    demand (manual), not every increment.
+
+# ----------------------------------------------------------------- extraction
+def _extract(sf, entity, cols, cursor_field, since, first):
+    """Yield (rows, running_total) per page.
+
+    first=True  -> Bulk 2.0 query (fast backfill, live rows only)
+    first=False -> Bulk 1.0 queryAll (includes IsDeleted rows for soft-delete)
+    Both filter `cursor > since` and order by the cursor ASC so an interrupted
+    run leaves a resumable prefix.
     """
-
-    @dlt.resource(name=f"{entity.lower()}__live_ids", write_disposition="replace")
-    def _res():
-        print(f"[{entity}] id 拉齐 (full live ids via Bulk 2.0)", flush=True)
-        n = 0
-        for page in getattr(sf.bulk2, entity).query(f"SELECT Id FROM {entity}"):
-            batch = [{"Id": row["Id"]} for row in csv.DictReader(io.StringIO(page))]
-            n += len(batch)
-            print(f"[{entity}] streamed {n} live ids", flush=True)
-            yield batch
-
-    return _res
-
-
-@dlt.source(name="salesforce")
-def salesforce_source(sf=None, initial_value=EPOCH):
-    sf = sf or get_sf()
-    for entity in ENTITIES:
-        yield _make_resource(sf, entity, _cursor_for(entity), initial_value)
+    select = f"SELECT {', '.join(cols)} FROM {entity}"
+    soql = f"{select} WHERE {cursor_field} > {since} ORDER BY {cursor_field} ASC"
+    n = 0
+    if first:
+        for chunk in getattr(sf.bulk2, entity).query(soql):
+            rows = [_norm(r, cursor_field) for r in csv.DictReader(io.StringIO(chunk))]
+            n += len(rows)
+            yield rows, n
+    else:
+        for batch in getattr(sf.bulk, entity).query_all(soql, lazy_operation=True):
+            rows = [_norm(rec, cursor_field) for rec in batch]
+            n += len(rows)
+            yield rows, n
 
 
-@dlt.source(name="salesforce_ids")
-def salesforce_ids_source(sf=None):
-    sf = sf or get_sf()
-    for entity in ENTITIES:
-        yield _make_ids_resource(sf, entity)
+# ------------------------------------------------------------------- public API
+def run_bronze(entities=None, seed_since=None, full_refresh=False, log=_print_flush):
+    """Load Salesforce entities into DuckLake bronze (direct, no dlt).
 
-
-def _pipeline():
-    creds = DuckLakeCredentials(
-        ducklake_name=DUCKLAKE_NAME, catalog=CATALOG, storage=STORAGE
-    )
-    return dlt.pipeline(
-        pipeline_name="sf_bronze",
-        destination=ducklake(credentials=creds),
-        dataset_name="bronze",
-    )
-
-
-def run_bronze(entities=None, seed_since=None):
-    """Run bronze ingestion.
-
-    seed_since: only used on a resource's FIRST run (before dlt has stored a
-    last_value). Pass e.g. datetime.now(tz)-timedelta(days=1) to seed a bounded
-    backfill for testing; leave None to backfill from EPOCH (full history).
-    After the first run dlt tracks the cursor itself and this is ignored.
+    entities: subset of API names to load (None = all configured).
+    seed_since: on a resource's FIRST load only, bound the backfill (datetime or
+        ISO string); ignored once the bronze table has rows. None = from EPOCH.
+    full_refresh: drop the entity's bronze table first and reload from scratch —
+        use to fix a watermark left wrong by an earlier bounded/test run.
+    log: callable for progress lines (default print; Dagster passes context.log.info
+        so the current entity/table shows up in the run log).
     """
-    src = salesforce_source(initial_value=seed_since or EPOCH)
-    if entities:
-        src = src.with_resources(*[e.lower() for e in entities])
-    return _pipeline().run(src, loader_file_format="parquet")
+    sf = get_sf()
+    todo = entities or ENTITIES
+    seed_dt = _parse_dt(seed_since) if isinstance(seed_since, str) else seed_since
+    con = _connect()
+    results = {}
+    try:
+        for entity in todo:
+            table = entity.lower()
+            cursor_field = _cursor_for(entity)
+            cols = queryable_fields(sf, entity)
+
+            if full_refresh and _table_exists(con, table):
+                con.execute(f"DROP TABLE {_fqtn(table)}")
+                log(f"[{entity}] full_refresh: dropped existing bronze.{table}")
+
+            wm = _watermark(con, table, cursor_field)
+            first = wm == EPOCH
+            if first and seed_dt:
+                wm = seed_dt.astimezone(timezone.utc)
+            since = (wm - timedelta(seconds=LAG_SECONDS)).astimezone(
+                timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            mode = "BULK2 backfill" if first else "BULK1 incremental"
+            log(f"[{entity}] {mode} since {since} ({len(cols)} cols) -> bronze.{table}")
+
+            total = 0
+            for rows, n in _extract(sf, entity, cols, cursor_field, since, first):
+                if rows:
+                    _upsert(con, table, _to_arrow(rows, cols, cursor_field), "Id")
+                total = n
+                log(f"[{entity}] streamed {total} rows")
+            results[table] = total
+            log(f"[{entity}] done -> {total} rows into bronze.{table}")
+    finally:
+        con.close()
+    return results
 
 
-def run_id_reconcile(entities=None):
-    """Manual: refresh the live-id sets used by silver to drop hard-deleted rows.
+def run_id_reconcile(entities=None, log=_print_flush):
+    """Manual: refresh Salesforce live-id snapshots so silver can drop hard-deletes.
 
-    Run after a normal bronze load so the live-id snapshot is fresh; silver then
-    anti-joins <entity>__live_ids to remove ids the source no longer has.
+    Soft-deletes (IsDeleted) are already caught by the incremental query_all; this
+    reconciles *hard* deletes (physically removed rows). Pulls the full set of live
+    Ids (cheapest request) via Bulk 2.0 into <table>__live_ids (replace semantics);
+    silver anti-joins it. Run on demand, then rebuild silver.
     """
-    src = salesforce_ids_source()
-    if entities:
-        src = src.with_resources(*[f"{e.lower()}__live_ids" for e in entities])
-    return _pipeline().run(src, loader_file_format="parquet")
+    sf = get_sf()
+    todo = entities or ENTITIES
+    con = _connect()
+    results = {}
+    try:
+        for entity in todo:
+            table = f"{entity.lower()}__live_ids"
+            log(f"[{entity}] id 拉齐 (full live ids via Bulk 2.0) -> bronze.{table}")
+            n = 0
+            created = False
+            for page in getattr(sf.bulk2, entity).query(f"SELECT Id FROM {entity}"):
+                ids = [row["Id"] for row in csv.DictReader(io.StringIO(page))]
+                batch = pa.table(
+                    [pa.array(ids, pa.string())],
+                    schema=pa.schema([pa.field("Id", pa.string())]),
+                )
+                con.register("_incoming", batch)
+                try:
+                    if not created:
+                        # replace semantics: drop the old snapshot, recreate
+                        if _table_exists(con, table):
+                            con.execute(f"DROP TABLE {_fqtn(table)}")
+                        con.execute(f"CREATE TABLE {_fqtn(table)} AS SELECT * FROM _incoming")
+                        created = True
+                    else:
+                        con.execute(f"INSERT INTO {_fqtn(table)} BY NAME SELECT * FROM _incoming")
+                finally:
+                    con.unregister("_incoming")
+                n += len(ids)
+                log(f"[{entity}] streamed {n} live ids")
+            if not created:
+                # source returned zero rows: leave an empty snapshot so the
+                # silver anti-join drops everything (source truly has no rows)
+                if _table_exists(con, table):
+                    con.execute(f"DROP TABLE {_fqtn(table)}")
+                con.execute(f'CREATE TABLE {_fqtn(table)} ("Id" VARCHAR)')
+            results[table] = n
+    finally:
+        con.close()
+    return results
 
 
 if __name__ == "__main__":

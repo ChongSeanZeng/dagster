@@ -22,18 +22,19 @@ import os
 import duckdb
 from azure.storage.blob import BlobServiceClient
 
+import catalog
+
 # Project root = this file's directory (forward-slash, portable Linux/Windows).
 BASE = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
-CATALOG_SQLITE = f"{BASE}/lake_catalog.duckdb"
 PUBLISH_DIR = f"{BASE}/publish"
 CONTAINER = "duck"
 
 
 def _connect():
-    """DuckDB connection with the DuckLake catalog attached as `lake`."""
+    """DuckDB connection with the (Postgres-backed) DuckLake catalog attached as `lake`."""
     con = duckdb.connect()
-    con.execute("INSTALL sqlite; LOAD sqlite; INSTALL ducklake; LOAD ducklake;")
-    con.execute(f"ATTACH 'ducklake:sqlite:{CATALOG_SQLITE}' AS lake")
+    con.execute("INSTALL postgres; LOAD postgres; INSTALL ducklake; LOAD ducklake;")
+    con.execute(f"ATTACH '{catalog.duckdb_attach_target()}' AS lake")
     return con
 
 

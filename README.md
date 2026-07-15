@@ -3,7 +3,8 @@
 基于 **DuckLake** 湖仓的 medallion（Bronze / Silver / Gold）分层数据平台：
 
 - **编排**：[Dagster](https://dagster.io/) —— 目前全部为**手动触发**资产，暂无定时调度。
-- **抽取（Bronze）**：[dlt](https://dlthub.com/) —— 从 **Salesforce** / **Dataverse** 增量加载**全部列**到 DuckLake `bronze`，按主键 `merge`。
+- **抽取（Bronze）**：**Salesforce** 直接用 `duckdb` 写入 DuckLake（无 dlt，见 `sf_bronze.py`）；**Dataverse** 仍用 [dlt](https://dlthub.com/)（见 `dataverse_bronze.py`）。两者都增量加载**全部列**到同一个 DuckLake `bronze`，按主键 `merge`。
+- **运行要求**：`duckdb >= 1.5`（catalog 已是 DuckLake 1.0 格式，1.4.x 的 ducklake 扩展只支持到 0.3，attach 会报 `Only DuckLake versions ...0.3 are supported`）。
 - **转换（Silver / Gold）**：[dbt](https://www.getdbt.com/) —— Silver 只保留**指定列**、去重、去删除；Gold 定期**快照**常见统计指标。
 - **对外发布**：Silver / Gold 以 **Parquet** 发布到 Azure Blob `duck` 容器，供其他应用直接消费。
 
@@ -45,12 +46,12 @@
 
 | 层 | 工具 | 位置 | 说明 |
 |----|------|------|------|
-| Bronze | dlt | DuckLake schema `bronze` | 拉取全部列，按 `Id` merge。**首次全量走 Bulk 2.0（快）**，**增量走 Bulk 1.0 `queryAll`**（捕获软删除 `IsDeleted`）。两条路径统一 schema：非游标列存文本、游标存 datetime。 |
-| Silver | dbt | DuckLake schema `silver` | 只保留 `silver_config.py` 指定的业务列；按游标去重取最新；剔除软删除；反连接 `__live_ids` 剔除硬删除；去掉 dlt 系统列。 |
+| Bronze | Salesforce: `duckdb` 直写；Dataverse: dlt | DuckLake schema `bronze` | 拉取全部列，按主键 merge。**首次全量走 Bulk 2.0（快）**，**增量走 Bulk 1.0 `queryAll`**（捕获软删除 `IsDeleted`）。两条路径统一 schema：非游标列存文本、游标存 datetime。SF 的增量水位 = bronze 表里已有的 `max(游标)`（无单独状态文件、无 dlt 游标）。 |
+| Silver | dbt | DuckLake schema `silver` | 只保留 `silver_config.py` 指定的业务列；按游标去重取最新；剔除软删除；反连接 `__live_ids` 剔除硬删除；keep-all 分支会去掉 dlt 系统列（仅 Dataverse 有）。 |
 | Gold | dbt | DuckLake schema `gold` | 从 silver 聚合常见统计（`daily.py` / `monthly_test.py` 的移植），每次运行**追加**一个带 `snapshot_date` 的快照。 |
 | 发布 | duckdb + azure | Blob 容器 `duck` | 把 silver / gold 每张表导出为 Parquet 上传。 |
 
-**关键事实：** DuckLake 的元数据 catalog 是一个 **SQLite** 文件（`lake_catalog.duckdb`，名字有误导性）；实际数据是 `lake/` 下的 Parquet。dlt 与 dbt **必须指向同一个 SQLite catalog**，否则 silver 读不到 bronze。
+**关键事实：** DuckLake 的元数据 catalog 现在存在**本机 Postgres**（数据库 `fsc_lake`，由 `catalog.py` 从 `local.setting.json` 的 `catalog_pg` 块读取连接）；实际数据是 `lake_pg/` 下的 Parquet。三个写入/读取方（`sf_bronze.py` 的 duckdb 直写、`dataverse_bronze.py` 的 dlt、dbt 的 `attach`）**必须指向同一个 Postgres catalog**，否则 silver 读不到 bronze。Postgres 后端支持**并发写入**（这正是启用 Dagster 并发管道的前提）。
 
 ---
 
@@ -60,22 +61,23 @@
 dagster/
 ├── definitions.py           # Dagster 资产定义（bronze / id_sync / silver / gold）
 ├── workspace.yaml           # Dagster 加载入口（指向 definitions.py）
-├── sf_bronze.py             # Salesforce → bronze（dlt）+ 硬删除 id 拉齐
+├── sf_bronze.py             # Salesforce → bronze（duckdb 直写，无 dlt）+ 硬删除 id 拉齐
 ├── dataverse_bronze.py      # Dataverse → bronze（dlt）+ 硬删除 id 拉齐
 ├── silver_config.py         # 每个实体的 silver「指定列」清单
 ├── gen_silver.py            # 由 silver_config 生成 silver dbt 模型 + _sources.yml
 ├── publish.py               # 导出 silver/gold 表为 Parquet 并上传到 Blob `duck`
 ├── daily.py / monthly_test.py  # 旧版参考脚本（Gold 已用 dbt 重写，仅供对照）
 ├── sf.py                    # 旧版全量脚本（silver 列清单的来源，仅供参考）
-├── local.setting.json       # 凭据（不入库，见 .gitignore）
-├── lake_catalog.duckdb      # DuckLake catalog（SQLite，不入库）
-├── lake/                    # DuckLake 数据文件（Parquet，不入库）
+├── local.setting.json       # 凭据（不入库，见 .gitignore；含 catalog_pg 块）
+├── catalog.py               # DuckLake catalog（Postgres）连接构建器
+├── lake_pg/                 # DuckLake 数据文件（Parquet，Postgres catalog，不入库）
 ├── publish/                 # 发布前的本地 Parquet 暂存（不入库）
-├── home/                    # DAGSTER_HOME（运行历史/日志，不入库）
+├── home/                    # DAGSTER_HOME（运行历史/日志，含 dagster.yaml，不入库）
+├── dagster.service          # systemd 服务单元（dagster dev）
 ├── requirements.txt
 └── dbt/
     ├── dbt_project.yml
-    ├── profiles.yml         # 连接 DuckLake（ducklake:sqlite:...）
+    ├── profiles.yml         # 连接 DuckLake（ducklake:postgres:...，经 DUCKLAKE_CATALOG）
     ├── seeds/regions.csv    # ISO3 → 区域映射（members 模型用）
     ├── macros/
     │   ├── silver_dedupe.sql    # 通用 silver 变换（去重/去删/选列）
@@ -127,10 +129,19 @@ pip install -r requirements.txt
   "dataverse": {
     "client_id": "<Azure AD 应用 client id>",
     "client_secret": "<Azure AD 应用 client secret>"
+  },
+  "catalog_pg": {
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "fsc_lake",
+    "user": "fsc",
+    "password": "<catalog 角色密码>"
   }
 }
 ```
 
+- `catalog_pg` 是 **DuckLake catalog 的 Postgres 连接**（元数据后端）。用超级用户建一次专用库/角色即可：
+  `CREATE ROLE fsc LOGIN PASSWORD '<pw>'; CREATE DATABASE fsc_lake OWNER fsc;`（`catalog.py` 从这里读取，构建 duckdb/dlt/dbt 三种连接形式）。数据文件仍是本地 Parquet（`./lake_pg`）。
 - `connection_string` 用于把 Parquet 发布到 `synapsedeltalake2022` 账户的 `duck` 容器。
 - `dataverse.client_id` / `dataverse.client_secret` 是 Dataverse 的 Azure AD 应用凭据；**必须放在这里**（本文件已被 `.gitignore` 排除），不要写进 `dataverse_bronze.py`——GitHub 的 secret 扫描会拦截含明文密钥的提交。租户 `authority_url` 与 `resource` 有非机密默认值，如需可在此 `dataverse` 块中覆盖。
 
@@ -146,7 +157,7 @@ export DAGSTER_HOME=$(pwd)/home        # 指向项目内的 home/ 目录
 
 ### 5. 首次校验 catalog 连通（重要）
 
-先只跑一个小实体，确认 dlt 与 dbt 共用同一个 SQLite catalog：
+先只跑一个小实体，确认 bronze 写入与 dbt 读取共用同一个 Postgres catalog：
 
 ```bash
 python -c "import sf_bronze; print(sf_bronze.run_bronze(entities=['RecordType']))"
@@ -155,23 +166,52 @@ cd dbt && dbt run --select silver.recordtype --profiles-dir . && cd ..
 
 若 `lake.silver.recordtype` 有数据、且只有 `Id, Name` 两列，说明打通成功。
 
-> 若 dlt 的 catalog 连接串报错，请根据 VM 上安装的 dlt 版本核对 `sf_bronze.py` / `dataverse_bronze.py` 中 `CATALOG` 的 scheme（目标是指向 `lake_catalog.duckdb` 这个 **SQLite** 文件，与 `dbt/profiles.yml` 一致）。
+> 连接由 `catalog.py` 从 `local.setting.json` 的 `catalog_pg` 块（host/port/dbname/user/password）构建，三方指向同一个 Postgres 库 `fsc_lake`。若 attach 报 `Only DuckLake versions ...0.3 are supported`，是 `duckdb < 1.5`：`pip install "duckdb>=1.5"`。手动跑 dbt 前需 `export DUCKLAKE_CATALOG="$(python -c 'import catalog;print(catalog.dbt_env()["DUCKLAKE_CATALOG"])')"`。
 
 ### 6. 启动 Dagster
+
+前台快速启动：
 
 ```bash
 dagster dev -h 0.0.0.0 -p 3000
 ```
 
-浏览器打开 `http://<vm-ip>:3000`。因为目前是手动触发、无定时调度，`dagster dev` 已足够；如需长期后台运行，可用 systemd 或 `nohup` 托管，并（若日后加调度）另跑 `dagster-daemon run`。
+浏览器打开 `http://<vm-ip>:3000`。因为目前是手动触发、无定时调度，`dagster dev` 已足够。
+
+#### 作为服务长期运行（systemd）
+
+项目根目录提供了现成的服务单元 **`dagster.service`**（启动 `dagster dev`，含 webserver + daemon）。安装一次：
+
+```bash
+sudo cp dagster.service /etc/systemd/system/dagster.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now dagster.service     # 开机自启 + 立即启动
+```
+
+常用管理：
+
+```bash
+systemctl status dagster          # 健康状态
+journalctl -u dagster -f          # 实时日志
+sudo systemctl restart dagster    # 改了 definitions.py / 配置后重启
+```
+
+> 单元文件里写死了 `WorkingDirectory=/home/ubuntu/dagster`、`DAGSTER_HOME`、`PATH`（含 venv/bin，保证 silver/gold 资产里 `dbt` 子进程能被找到）。路径不同请自行修改。
+
+#### 实例配置 `home/dagster.yaml`（DAGSTER_HOME）
+
+Dagster 的实例配置在 `home/dagster.yaml`（即 `DAGSTER_HOME`）。除自动生成的存储路径外，已加入：
+
+- `run_coordinator: QueuedRunCoordinator` + `max_concurrent_runs: 4` —— catalog 迁到 Postgres（支持并发写）后，跨 run 并发上限设为 4（run 内并行由 `definitions.py` 的 `multiprocess_executor` 控制）。由 `dagster dev` 启动的 daemon 负责出队。机器吃紧就调小。
+- `telemetry.enabled: false` —— 关闭匿名遥测。
 
 ---
 
 ## 本地测试（Windows）
 
-代码路径全部是相对/动态的，因此在 Windows 上可以直接跑一套**独立的本地湖仓**（catalog、`lake/`、`publish/` 都生成在项目目录内），用于开发调试。步骤：
+代码路径全部相对/动态，Windows 上可跑一套**独立的本地湖仓**（数据文件 `lake_pg/`、`publish/` 都生成在项目目录内）用于调试。**除了首次装环境，其余全部在 Dagster UI 里点按钮完成，无需命令行。**
 
-代码路径全部相对/动态，Windows 上可跑一套**独立的本地湖仓**（catalog、`lake/`、`publish/` 都生成在项目目录内）用于调试。**除了首次装环境，其余全部在 Dagster UI 里点按钮完成，无需命令行。**
+> ⚠️ **catalog 现在是 Postgres**：本地也需要一个可连的 Postgres，并在 `local.setting.json` 的 `catalog_pg` 块填好连接（本机装一个 Postgres，建 `fsc_lake` 库/`fsc` 角色即可）。不再有 SQLite 单文件 catalog。
 
 > ⚠️ **Python 版本**：用 **3.11 / 3.12**。dbt-core 不支持 3.13/3.14——在 3.14 上 `import dbt` 会因 `mashumaro` 直接报错（`UnserializableField: Field "schema" ...`）。dlt/bronze 在 3.14 能跑，dbt 不行。
 
@@ -214,10 +254,10 @@ dagster dev
 
 要点：
 
-- **Bronze 必须先于 dbt(silver/gold) 运行**。DuckLake 新建 catalog 时需要 `DATA_PATH`（由 dlt 的 `STORAGE` 提供）；dbt 只「附加已存在的 catalog」，不带 `DATA_PATH`，所以必须先由 bronze 建好 catalog。UI 里 `silver` 对 bronze 有依赖连线，先点 bronze 再点 silver 即可。
-- **catalog 与 `lake/` 必须在同一台机器**：数据文件的绝对路径记录在 catalog 元数据里。VM 上生成的 `lake_catalog.duckdb` 拿到 Windows 用不了（里面是 Linux 路径）——本地测试重新跑一遍 bronze 即可。
+- **Bronze 必须先于 dbt(silver/gold) 运行**。DuckLake **新建** catalog 时需要 `DATA_PATH`；Dataverse 的 dlt 由 `STORAGE` 提供，能建新 catalog。`sf_bronze.py` 与 dbt 都只「附加已存在的 catalog」（不带 `DATA_PATH`，路径从 catalog 元数据读），所以**全新机器上先跑一次 `dataverse_bronze`（或已存在 catalog）**，再跑 SF/silver。UI 里 `silver` 对 bronze 有依赖连线，先点 bronze 再点 silver 即可。
+- **catalog（Postgres）与 `lake_pg/` 必须在同一台机器**：数据文件的绝对路径记录在 catalog 元数据里（`file://.../lake_pg`）。换机器不能直接搬数据——重新跑一遍 bronze 即可。
 - 已在 **Windows 3.12** 上端到端验证：`salesforce_bronze`（config `entities:["RecordType"]`）→ `silver`（`select:"silver.recordtype"`）全部 `RUN_SUCCESS`，silver 产物只有 `Id,Name`、46 行、无 dlt 列。
-- 需要联网让 DuckDB 首次 `INSTALL ducklake/sqlite/azure` 下载扩展；Bronze 抽取仍需 Salesforce/Dataverse 凭据。纯 dbt/publish/查询逻辑可离线在本地湖仓上调试。
+- 需要联网让 DuckDB 首次 `INSTALL ducklake/postgres/azure` 下载扩展；catalog 需本机 Postgres 可达；Bronze 抽取仍需 Salesforce/Dataverse 凭据。纯 dbt/publish/查询逻辑可离线在本地湖仓上调试。
 
 ---
 
@@ -232,10 +272,12 @@ fsc_lake:
     dev:
       type: duckdb
       path: dbt.duckdb                     # 相对 dbt/ 目录；仅作 DuckDB 会话锚点
-      threads: 1                            # DuckLake 的 SQLite catalog 单写，必须串行
-      extensions: [sqlite, ducklake]
+      threads: 4                            # Postgres catalog 支持并发写，dbt 可并行建模
+      extensions: [postgres, ducklake]
       attach:
-        - path: "ducklake:sqlite:../lake_catalog.duckdb"   # 相对路径 → 项目根的 catalog
+        # Postgres catalog；完整连接串（含密码）由 DUCKLAKE_CATALOG 环境变量注入，
+        # 不落进本文件。Dagster 自动注入；手动 dbt 前先 export（见上文 catalog 说明）。
+        - path: "ducklake:{{ env_var('DUCKLAKE_CATALOG') }}"
           alias: lake                       # 模型里通过 lake.silver.* / lake.gold.* 访问
 ```
 
@@ -376,15 +418,24 @@ df = con.execute("SELECT * FROM read_parquet('az://duck/silver/account.parquet')
 
 > 也可以先把 blob 里的 parquet 下载到本地再用任意工具读取；这些 Parquet 是自包含的，不依赖 catalog。
 
-### 方式 B：直接连 DuckLake catalog（需能访问 VM 上的 catalog 与 lake/ 目录）
+### 方式 B：直接连 DuckLake catalog（需能访问 VM 上的 Postgres 与 lake_pg/ 目录）
 
-适合在 VM 上、或把 `lake_catalog.duckdb` 与 `lake/` 目录一并拷出来的场景。DuckLake 的数据文件路径记录在 catalog 元数据里（`file://.../lake`），因此 **catalog 和 lake/ 必须同时可达且路径一致**。
+适合在 VM 上直接查询。DuckLake 元数据在 Postgres 库 `fsc_lake`，数据文件路径记录在元数据里（`file://.../lake_pg`），因此 **Postgres 可达且 lake_pg/ 路径一致**。用 `catalog.py` 生成连接串免得手写密码：
+
+```bash
+python -c "import duckdb, catalog as k; c=duckdb.connect(); \
+  c.execute('INSTALL postgres;LOAD postgres;INSTALL ducklake;LOAD ducklake;'); \
+  c.execute(f\"ATTACH '{k.duckdb_attach_target()}' AS lake\"); \
+  print(c.execute('SELECT * FROM lake.gold.fm_per_country LIMIT 20').fetchall())"
+```
+
+或在 SQL 里手动 attach（把 `<...>` 换成 `local.setting.json` 的 `catalog_pg`）：
 
 ```sql
-INSTALL sqlite;   LOAD sqlite;
+INSTALL postgres; LOAD postgres;
 INSTALL ducklake; LOAD ducklake;
 
-ATTACH 'ducklake:sqlite:/home/ubuntu/dagster/lake_catalog.duckdb' AS lake;
+ATTACH 'ducklake:postgres:dbname=fsc_lake host=localhost port=5432 user=fsc password=<pw>' AS lake;
 
 -- 列出所有表
 SELECT table_schema, table_name
@@ -397,7 +448,7 @@ SELECT * FROM lake.silver.account LIMIT 100;
 SELECT * FROM lake.gold.members WHERE snapshot_date = (SELECT max(snapshot_date) FROM lake.gold.members);
 ```
 
-命令行：`duckdb -c "INSTALL ducklake; LOAD ducklake; INSTALL sqlite; LOAD sqlite; ATTACH 'ducklake:sqlite:/home/ubuntu/dagster/lake_catalog.duckdb' AS lake; SELECT * FROM lake.gold.fm_per_country LIMIT 20;"`
+命令行：`duckdb -c "INSTALL ducklake; LOAD ducklake; INSTALL postgres; LOAD postgres; ATTACH 'ducklake:postgres:dbname=fsc_lake host=localhost user=fsc password=<pw>' AS lake; SELECT * FROM lake.gold.fm_per_country LIMIT 20;"`
 
 ---
 
@@ -418,17 +469,14 @@ SELECT * FROM lake.gold.members WHERE snapshot_date = (SELECT max(snapshot_date)
 
 ## 注意事项与排错
 
-- **路径可移植**：项目根由各模块 `__file__` 自动推断，dbt 用相对路径，Linux VM 与本地 Windows 通用，无需改路径。注意 catalog 与 `lake/` 是同机绑定的（元数据里是绝对路径），跨机器不能直接搬 `lake_catalog.duckdb`——换机器重跑 bronze 即可。
-- **catalog 是 SQLite**：`lake_catalog.duckdb` 实为 SQLite。dlt（`sf_bronze.py`/`dataverse_bronze.py` 的 `CATALOG`）与 dbt（`profiles.yml` 的 `attach`）必须指向同一个 SQLite catalog，否则 silver 读不到 bronze。
+- **路径可移植**：项目根由各模块 `__file__` 自动推断，dbt 用相对路径，Linux VM 与本地 Windows 通用，无需改路径。注意 catalog（Postgres）与 `lake_pg/` 是同机绑定的（元数据里是绝对路径），跨机器不能直接搬——换机器重跑 bronze 即可。
+- **catalog 是 Postgres**：元数据在本机 Postgres 库 `fsc_lake`，连接由 `catalog.py` 从 `local.setting.json` 的 `catalog_pg` 块构建。三方各自的连接形式不同但指向同一个库：SF/publish 用 duckdb `ATTACH 'ducklake:postgres:...'`（`catalog.duckdb_attach_target()`）、Dataverse 的 dlt 用 URL `postgresql://...`（`catalog.dlt_catalog()`）、dbt 用 `profiles.yml` 里的 `{{ env_var('DUCKLAKE_CATALOG') }}`（Dagster 由 `catalog.dbt_env()` 注入；手动 `dbt` 前需 `export DUCKLAKE_CATALOG=...`）。**需 `duckdb >= 1.5`**（DuckLake 1.0 格式）。
 - **列名大小写**：silver 用带引号的精确列名投影。若某列在 bronze 中的大小写与 `silver_config.py` 不一致（例如 `policy_omit_trademark_symbols__c`），silver 构建会报「列不存在」。排查：`DESCRIBE lake.bronze.<表名>;` 核对真实列名并同步到配置。
-- **DuckLake 单写 / 并发**：catalog 是 SQLite，单写。两个资产同时写湖仓会报 `Failed to commit DuckLake transaction`。因此：dbt `threads: 1` 不要改大；Dagster 已用 `in_process_executor`（一个 run 内的资产串行，"Materialize all" 也安全）。要连**跨 run**（分别多次点 Materialize）也串行，在 `DAGSTER_HOME/dagster.yaml` 加：
-  ```yaml
-  run_coordinator:
-    module: dagster.core.run_coordinator
-    class: QueuedRunCoordinator
-    config:
-      max_concurrent_runs: 1
-  ```
+- **DuckLake 并发（Postgres 后端）**：catalog 迁到 Postgres 后支持并发写入，因此已开启并发：
+  - `definitions.py` 用 `multiprocess_executor.configured({"max_concurrent": 4})`——一个 run 内的资产可并行（如 `salesforce_bronze` 与 `dataverse_bronze` 同时写不同表）。
+  - `home/dagster.yaml` 的 `QueuedRunCoordinator max_concurrent_runs: 4`——跨 run 并发上限。
+  - dbt `profiles.yml` `threads: 4`——dbt 并行构建独立模型。
+  - 注意：**不同表**并发写安全；**同一张表**并发提交走乐观并发，冲突会重试（dbt/dlt 的 DAG 一般不会让两个进程写同一张表）。机器吃紧就把这几个数调小。
 - **Gold 快照幂等**：同一 `snapshot_date` 重复运行 gold 不会重复追加（模型内有去重保护）；换一天则追加新快照。
 - **Gold 数值字段**：源自 Salesforce 的数值/日期在 bronze 里可能是字符串，gold 用 `try_cast` 容错，无法解析的值会变成 `NULL` 并在过滤中被排除。
 - **旧版脚本**：`daily.py` / `monthly_test.py` 仅作为 Gold 逻辑的对照参考，新栈不再依赖它们（`monthly_test.py` 第 169–171 行有历史遗留的语法问题，已在 dbt 移植中规避）。

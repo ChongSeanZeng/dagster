@@ -2,17 +2,16 @@
 local.setting.json
 .dlt/secrets.toml
 
-# --- DuckLake: catalog metadata (SQLite) + parquet data files ---
-lake_catalog.duckdb
-lake_catalog.duckdb.wal
-lake/
-lake.vmbak
+# --- DuckLake: parquet data files (catalog metadata lives in Postgres) ---
+lake_pg/
 *.vmbak
 # --- published output parquet / json ---
 publish/
 
 # --- Dagster instance home (storage/history/logs/artifacts) ---
 home/
+# ...but keep the instance config (concurrency etc.) under version control
+!home/dagster.yaml
 
 # --- dbt build artifacts (regenerated on run) ---
 dbt/target/

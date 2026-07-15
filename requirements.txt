@@ -9,7 +9,10 @@ dagster-webserver
 
 # Bronze 抽取（dlt + DuckLake）
 dlt>=1.6.0
-duckdb>=1.1.0
+# DuckLake catalog 已升级到格式 1.0（由 duckdb 1.5.x 的 ducklake 扩展写入）；
+# duckdb 1.4.x 及更早的 ducklake 只支持到 0.3，attach 时会报
+# "Only DuckLake versions 0.1, 0.2, 0.3-dev1 and 0.3 are supported"。必须 >=1.5。
+duckdb>=1.5.0
 pyarrow>=15.0.0            # dlt 以 parquet 格式写入时需要（loader_file_format="parquet"）
 simple-salesforce          # Salesforce（Bulk 1.0 / 2.0）
 adal                       # Dataverse (Azure AD) 认证

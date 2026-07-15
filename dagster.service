@@ -1,0 +1,39 @@
+# systemd service unit for the FSC Dagster lakehouse UI.
+#
+# Runs `dagster dev` (webserver + daemon) as a background service so the UI at
+# http://<vm-ip>:3000 survives logout/reboot. `dagster dev` is sufficient here
+# because triggering is manual (no schedules yet); the daemon it starts is what
+# enforces the single-run queue configured in home/dagster.yaml.
+#
+# Install (run once, as a user with sudo):
+#   sudo cp /home/ubuntu/dagster/dagster.service /etc/systemd/system/dagster.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dagster.service
+# Manage:
+#   systemctl status dagster        # health
+#   journalctl -u dagster -f        # live logs
+#   sudo systemctl restart dagster  # after editing definitions.py / configs
+#
+# If the project or venv path differs, edit WorkingDirectory / Environment / ExecStart.
+
+[Unit]
+Description=Dagster (FSC medallion lakehouse) UI + daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/dagster
+# DAGSTER_HOME must be an absolute path; it points at the in-project home/ dir
+# (run history, logs, dagster.yaml instance config).
+Environment=DAGSTER_HOME=/home/ubuntu/dagster/home
+# Put the venv on PATH so the silver/gold assets' `dbt` subprocess resolves and
+# dagster/dlt/duckdb use the venv interpreter.
+Environment=PATH=/home/ubuntu/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/ubuntu/.venv/bin/dagster dev -h 0.0.0.0 -p 3000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
