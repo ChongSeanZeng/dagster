@@ -30,6 +30,7 @@ separate manual step (run_id_reconcile) that snapshots the live Ids into
 import csv
 import io
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 # Preserve original Salesforce column names (Id, SystemModstamp, Genus__c) instead
@@ -83,6 +84,34 @@ CURSOR_OVERRIDES = {
 
 def _cursor_for(entity):
     return CURSOR_OVERRIDES.get(entity, "SystemModstamp")
+
+
+# Optional per-entity business filter (SOQL WHERE fragment), ported from the
+# original sf.py / weekly.py QUERIES so bronze pulls the same business subset as
+# the legacy full-load (not the entire raw table). Combined with the incremental
+# cursor filter. Entities not listed here pull all rows. This is why e.g.
+# Product_Species__c loads a subset instead of ~7.4M raw rows.
+ENTITY_FILTERS = {
+    "Product_Species__c": "Product_Class__c != null",
+    "Account": (
+        "Hide_Site__c = false AND Type NOT IN ("
+        "'03-CORP grants and MEMB', '04-DEV AG', '05-FND - private', "
+        "'05-FND - public', '06-FUNDING CONSORTIUM', '07-GOV - tech corp', "
+        "'08-NGO', 'Corporation')"
+    ),
+    "Certificate_c__c": "CB__c <> 'ASI' AND Cert_Status__c <> 'Will not be certified'",
+    "Certificate_Attachment__c": (
+        "Active__c = true AND Document_Type__c IN ("
+        "'(Extended) Company Risk Assessment (available on Website)', "
+        "'Ecosystem Services Certification Document (available on Website)', "
+        "'Forest Management Standard (available on website)', "
+        "'List of participating sites/group members/FMUs (available on website)', "
+        "'Product Registration Form (available on website)', "
+        "'Public Summary Report (available on website)', "
+        "'Supplementary File (available on website)')"
+    ),
+    "Evaluation__c": "Display_publicly__c = true AND Schedule_Evaluation__c = true",
+}
 
 
 def _print_flush(msg):
@@ -228,20 +257,29 @@ def _upsert(con, table, batch, primary_key):
 def _extract(sf, entity, cols, cursor_field, since, first):
     """Yield (rows, running_total) per page.
 
-    first=True  -> Bulk 2.0 query (fast backfill, live rows only)
-    first=False -> Bulk 1.0 queryAll (includes IsDeleted rows for soft-delete)
-    Both filter `cursor > since` and order by the cursor ASC so an interrupted
-    run leaves a resumable prefix.
+    first=True  -> Bulk 2.0 query (fast backfill, live rows only). NO ORDER BY:
+        an ORDER BY on Bulk 2.0 makes Salesforce sort the WHOLE table server-side
+        before returning the first row — minutes of latency on big tables. The
+        caller runs the backfill in one transaction, so we don't need an ordered
+        prefix for crash-safety (an interrupted backfill just commits nothing).
+    first=False -> Bulk 1.0 queryAll (includes IsDeleted rows for soft-delete),
+        ORDER BY cursor ASC: the incremental result set is small (rows since the
+        watermark), so the sort is cheap and per-page commits form a safe prefix.
     """
     select = f"SELECT {', '.join(cols)} FROM {entity}"
-    soql = f"{select} WHERE {cursor_field} > {since} ORDER BY {cursor_field} ASC"
+    where = f"{cursor_field} > {since}"
+    biz = ENTITY_FILTERS.get(entity)
+    if biz:  # AND the business subset filter (ported from sf.py) with the cursor
+        where = f"({biz}) AND {where}"
     n = 0
     if first:
+        soql = f"{select} WHERE {where}"
         for chunk in getattr(sf.bulk2, entity).query(soql):
             rows = [_norm(r, cursor_field) for r in csv.DictReader(io.StringIO(chunk))]
             n += len(rows)
             yield rows, n
     else:
+        soql = f"{select} WHERE {where} ORDER BY {cursor_field} ASC"
         for batch in getattr(sf.bulk, entity).query_all(soql, lazy_operation=True):
             rows = [_norm(rec, cursor_field) for rec in batch]
             n += len(rows)
@@ -249,8 +287,56 @@ def _extract(sf, entity, cols, cursor_field, since, first):
 
 
 # ------------------------------------------------------------------- public API
-def run_bronze(entities=None, seed_since=None, full_refresh=False, log=_print_flush):
-    """Load Salesforce entities into DuckLake bronze (direct, no dlt).
+def _load_entity(sf, entity, seed_dt, full_refresh, log):
+    """Load one Salesforce entity into bronze on its OWN duckdb connection
+    (connections aren't thread-safe to share). Backfill runs in a single
+    transaction so an interrupted run commits nothing; incremental commits
+    per page (ordered, so a partial run is a safe prefix). Returns (table, rows)."""
+    table = entity.lower()
+    cursor_field = _cursor_for(entity)
+    con = _connect()
+    try:
+        cols = queryable_fields(sf, entity)
+        if full_refresh and _table_exists(con, table):
+            con.execute(f"DROP TABLE {_fqtn(table)}")
+            log(f"[{entity}] full_refresh: dropped existing bronze.{table}")
+
+        wm = _watermark(con, table, cursor_field)
+        first = wm == EPOCH
+        if first and seed_dt:
+            wm = seed_dt.astimezone(timezone.utc)
+        since = (wm - timedelta(seconds=LAG_SECONDS)).astimezone(
+            timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        mode = "BULK2 backfill" if first else "BULK1 incremental"
+        log(f"[{entity}] {mode} since {since} ({len(cols)} cols) -> bronze.{table}")
+
+        total = 0
+        if first:
+            con.execute("BEGIN")  # atomic backfill: interrupted -> nothing committed
+        try:
+            for rows, n in _extract(sf, entity, cols, cursor_field, since, first):
+                if rows:
+                    _upsert(con, table, _to_arrow(rows, cols, cursor_field), "Id")
+                total = n
+                log(f"[{entity}] streamed {total} rows")
+            if first:
+                con.execute("COMMIT")
+        except Exception:
+            if first:
+                con.execute("ROLLBACK")
+            raise
+        log(f"[{entity}] done -> {total} rows into bronze.{table}")
+        return table, total
+    finally:
+        con.close()
+
+
+def run_bronze(entities=None, seed_since=None, full_refresh=False, log=_print_flush,
+               max_workers=4):
+    """Load Salesforce entities into DuckLake bronze (direct, no dlt), entities in
+    PARALLEL (each on its own connection / Salesforce bulk job).
 
     entities: subset of API names to load (None = all configured).
     seed_since: on a resource's FIRST load only, bound the backfill (datetime or
@@ -259,43 +345,28 @@ def run_bronze(entities=None, seed_since=None, full_refresh=False, log=_print_fl
         use to fix a watermark left wrong by an earlier bounded/test run.
     log: callable for progress lines (default print; Dagster passes context.log.info
         so the current entity/table shows up in the run log).
+    max_workers: how many entities to load concurrently. The Postgres catalog
+        allows concurrent writers (each entity is a different table), and bulk
+        extraction is I/O-bound, so this cuts a full load to ~the slowest entity.
     """
     sf = get_sf()
     todo = entities or ENTITIES
     seed_dt = _parse_dt(seed_since) if isinstance(seed_since, str) else seed_since
-    con = _connect()
     results = {}
-    try:
-        for entity in todo:
-            table = entity.lower()
-            cursor_field = _cursor_for(entity)
-            cols = queryable_fields(sf, entity)
-
-            if full_refresh and _table_exists(con, table):
-                con.execute(f"DROP TABLE {_fqtn(table)}")
-                log(f"[{entity}] full_refresh: dropped existing bronze.{table}")
-
-            wm = _watermark(con, table, cursor_field)
-            first = wm == EPOCH
-            if first and seed_dt:
-                wm = seed_dt.astimezone(timezone.utc)
-            since = (wm - timedelta(seconds=LAG_SECONDS)).astimezone(
-                timezone.utc
-            ).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-            mode = "BULK2 backfill" if first else "BULK1 incremental"
-            log(f"[{entity}] {mode} since {since} ({len(cols)} cols) -> bronze.{table}")
-
-            total = 0
-            for rows, n in _extract(sf, entity, cols, cursor_field, since, first):
-                if rows:
-                    _upsert(con, table, _to_arrow(rows, cols, cursor_field), "Id")
-                total = n
-                log(f"[{entity}] streamed {total} rows")
-            results[table] = total
-            log(f"[{entity}] done -> {total} rows into bronze.{table}")
-    finally:
-        con.close()
+    errors = {}
+    workers = max(1, min(max_workers, len(todo)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_load_entity, sf, e, seed_dt, full_refresh, log): e for e in todo}
+        for fut in as_completed(futs):
+            entity = futs[fut]
+            try:
+                table, total = fut.result()
+                results[table] = total
+            except Exception as e:  # keep loading the rest; report at the end
+                errors[entity] = repr(e)
+                log(f"[{entity}] FAILED: {e!r}")
+    if errors:
+        raise RuntimeError(f"salesforce bronze: {len(errors)} entity/entities failed: {errors}")
     return results
 
 

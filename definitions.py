@@ -59,6 +59,9 @@ class BronzeConfig(Config):
     # bounded/test run. Combine with `entities` to refresh just one; leave
     # `seed_since_days` empty for full history.
     full_refresh: bool = False
+    # Salesforce only: how many entities to load concurrently (each on its own
+    # connection + bulk job). Dataverse (dlt) ignores this.
+    max_workers: int = 4
 
 
 class IdSyncConfig(Config):
@@ -122,6 +125,7 @@ def salesforce_bronze(context: AssetExecutionContext, config: BronzeConfig):
         seed_since=seed,
         full_refresh=config.full_refresh,
         log=context.log.info,
+        max_workers=config.max_workers,
     )
     context.log.info(str(info))
     return str(info)
