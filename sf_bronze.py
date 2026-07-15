@@ -62,7 +62,7 @@ ENTITIES = [
     "Account",
     "Certificate_c__c",
     "Certificate_Status__c",
-    "Certificate_Attachment__c",
+    # "Certificate_Attachment__c",
     "Contact",
     "Non_Certificate_Holder__c",
     "Country_Data__c",

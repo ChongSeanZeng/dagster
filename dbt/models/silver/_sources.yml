@@ -10,7 +10,6 @@ sources:
       - name: account
       - name: certificate_c__c
       - name: certificate_status__c
-      - name: certificate_attachment__c
       - name: contact
       - name: non_certificate_holder__c
       - name: country_data__c
@@ -27,7 +26,6 @@ sources:
       - name: account__live_ids
       - name: certificate_c__c__live_ids
       - name: certificate_status__c__live_ids
-      - name: certificate_attachment__c__live_ids
       - name: contact__live_ids
       - name: non_certificate_holder__c__live_ids
       - name: country_data__c__live_ids
